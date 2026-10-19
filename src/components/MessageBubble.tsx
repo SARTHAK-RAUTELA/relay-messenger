@@ -4,11 +4,17 @@ import { useState } from "react";
 import type { TimelineItem } from "@/client/derive";
 import type { ReplyRef } from "@/shared/types";
 import { copy } from "@/client/copy";
+import { serviceText } from "@/client/derive";
+import { REACTIONS } from "@/shared/peer";
 import { StatusIcon } from "./StatusIcon";
 
 export interface BubbleProps {
   item: TimelineItem;
+  /** Shown above incoming group messages. */
+  senderName: string | null;
   canEdit: boolean;
+  canForward: boolean;
+  onReact(emoji: string | null): void;
   highlighted: boolean;
   selectionMode: boolean;
   selected: boolean;
@@ -53,6 +59,15 @@ export function MessageBubble(p: BubbleProps) {
     .join("\n");
 
   const selectable = p.selectionMode && !isPending;
+  if (msg?.service) {
+    return (
+      <div className="service-row" data-mid={msg.id} data-incoming={!msg.out ? "1" : undefined} data-testid={`msg-${msg.id}`}>
+        <span>{serviceText(msg.service, msg.out ? copy.you : (msg.senderName ?? ""))}</span>
+      </div>
+    );
+  }
+  const reactions = msg?.reactions ?? [];
+  const mine = reactions.find((r) => r.mine)?.emoji ?? null;
   return (
     <div
       className={`bubble-row ${out ? "out" : "in"}${selectable ? " selectable" : ""}`}
@@ -67,7 +82,14 @@ export function MessageBubble(p: BubbleProps) {
       }}
     >
       {p.selectionMode && !isPending && <span className={`select-box${p.selected ? " on" : ""}`} aria-checked={p.selected} role="checkbox" />}
-      <div className={`bubble${p.highlighted ? " highlight" : ""}${failed ? " failed" : ""}`}>
+      <div
+        className={`bubble${p.highlighted ? " highlight" : ""}${failed ? " failed" : ""}${msg?.undecryptable ? " undecryptable" : ""}`}
+      >
+        {p.senderName && !out && (
+          <div className="sender-name" data-testid="sender-name">
+            {p.senderName}
+          </div>
+        )}
         {fwd && (
           <div className="fwd-head" data-testid="fwd-head">
             {copy.forwardedFrom(fwd.name)}
@@ -93,6 +115,23 @@ export function MessageBubble(p: BubbleProps) {
           </button>
         )}
         <div className="bubble-text">{text}</div>
+        {reactions.length > 0 && (
+          <div className="reactions" data-testid="reactions">
+            {reactions.map((r) => (
+              <button
+                key={r.emoji}
+                className={`reaction${r.mine ? " mine" : ""}`}
+                aria-pressed={r.mine}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  p.onReact(r.mine ? null : r.emoji);
+                }}
+              >
+                {r.emoji} {r.count}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="foot" title={tip} data-testid="time">
           {msg?.editDate && <span data-testid="edited">{copy.edited}</span>}
           <span>{fmtTime(date)}</span>
@@ -119,6 +158,18 @@ export function MessageBubble(p: BubbleProps) {
         )}
         {menu && !isPending && (
           <ul className="menu" role="menu" onMouseLeave={() => setMenu(false)}>
+            <li className="react-bar" aria-label={copy.react}>
+              {REACTIONS.map((emoji) => (
+                <button
+                  key={emoji}
+                  aria-label={`${copy.react} ${emoji}`}
+                  aria-pressed={mine === emoji}
+                  onClick={() => (setMenu(false), p.onReact(mine === emoji ? null : emoji))}
+                >
+                  {emoji}
+                </button>
+              ))}
+            </li>
             <li>
               <button role="menuitem" onClick={() => (setMenu(false), p.onReply())}>
                 {copy.menuReply}
@@ -131,11 +182,13 @@ export function MessageBubble(p: BubbleProps) {
                 </button>
               </li>
             )}
-            <li>
-              <button role="menuitem" onClick={() => (setMenu(false), p.onForward())}>
-                {copy.menuForward}
-              </button>
-            </li>
+            {p.canForward && (
+              <li>
+                <button role="menuitem" onClick={() => (setMenu(false), p.onForward())}>
+                  {copy.menuForward}
+                </button>
+              </li>
+            )}
             <li>
               <button role="menuitem" onClick={() => (setMenu(false), p.onSelect())}>
                 {copy.menuSelect}

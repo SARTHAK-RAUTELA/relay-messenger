@@ -6,6 +6,11 @@ export const copy = {
   signIn: "Sign in",
   register: "Create account",
   username: "Username",
+  usernameOrEmail: "Username or email",
+  email: "Email",
+  emailSaved: "Email updated.",
+  saveEmail: "Save email",
+  addEmailHint: "Add an email so you can also sign in with it.",
   displayName: "Your name",
   password: "Password",
   switchToRegister: "New here? Create an account",
@@ -72,4 +77,68 @@ export const copy = {
   sentAt: "Sent",
   editedAt: "Edited",
   originallySent: "Originally sent",
+
+  // presence & typing
+  online: "online",
+  lastSeen: (when: string) => `last seen ${when}`,
+  lastSeenLongAgo: "last seen a while ago",
+  typing: "typing…",
+  typingNames: (names: string[]) =>
+    names.length === 1 ? `${names[0]} is typing…` : names.length === 2 ? `${names[0]} and ${names[1]} are typing…` : "Several people are typing…",
+
+  // reactions
+  react: "React",
+
+  // profile & account
+  settings: "Settings",
+  profile: "Profile",
+  saveName: "Save name",
+  nameSaved: "Name updated.",
+  changePassword: "Change password",
+  currentPassword: "Current password",
+  newPassword: "New password",
+  passwordChanged: "Password changed. Other devices were signed out.",
+  deleteAccount: "Delete account",
+  deleteAccountHint: "Your name becomes “Deleted account”, you leave all groups and can't sign in again. People keep the messages you sent them.",
+  deleteAccountConfirm: "Delete my account",
+  close: "Close",
+  you: "You",
+  everyone: "everyone",
+
+  // blocking
+  block: "Block",
+  unblock: "Unblock",
+  blockedBanner: "You blocked this person. They can't message you.",
+  peerDeletedBanner: "This account was deleted.",
+
+  // groups
+  newGroup: "New group",
+  groupName: "Group name",
+  addPeople: "Add people",
+  createGroup: "Create group",
+  groupInfo: "Group info",
+  members: (n: number) => (n === 1 ? "1 member" : `${n} members`),
+  owner: "owner",
+  rename: "Rename",
+  remove: "Remove",
+  leaveGroup: "Leave group",
+  removedFromChat: "You're no longer in that group.",
+  pickAtLeastOne: "Pick at least one person.",
+  service: {
+    groupCreated: (actor: string, title: string) => `${actor} created the group “${title}”`,
+    membersAdded: (actor: string, names: string[]) => `${actor} added ${names.join(", ")}`,
+    memberRemoved: (actor: string, name: string) => `${actor} removed ${name}`,
+    memberLeft: (actor: string) => `${actor} left the group`,
+    groupRenamed: (actor: string, title: string) => `${actor} renamed the group to “${title}”`,
+    secretStarted: (actor: string) => `${actor} started a secret chat. Messages are end-to-end encrypted.`,
+  },
+
+  // secret chats
+  startSecret: "Start secret chat",
+  secretBadge: "Secret chat",
+  secretKey: "Encryption key",
+  secretKeyHint: "Compare this code with the other person. If it matches on both screens, nobody is in the middle.",
+  secretOtherDevice: "This secret chat belongs to another device or browser. It can't be read here.",
+  secretUnsupported: "Secret chats need a secure connection (https or localhost) in this browser.",
+  cantDecrypt: "🔒 Can't decrypt on this device",
 };

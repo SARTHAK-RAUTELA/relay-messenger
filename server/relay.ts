@@ -1,22 +1,58 @@
 // Core server rules (spec sections 3, 5, 6). Transport-agnostic: the HTTP layer calls these
 // methods; every state change and its events are committed in one SQLite transaction and
 // pushed to connected sockets after commit (BR-SYNC-1).
+//
+// A conversation is addressed by a peer id (src/shared/peer.ts): a user, a group or a secret
+// chat. `Chat` is the resolved form; message rows carry enough to find their chat again.
 
 import type Database from "better-sqlite3";
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import type { DB } from "./db/client";
-import { dialogs, events, messageHidden, messages, sessions, users } from "./db/schema";
+import {
+  blocks,
+  dialogs,
+  events,
+  groupMembers,
+  groups,
+  messageHidden,
+  messageReactions,
+  messages,
+  secretChats,
+  sessions,
+  userKeys,
+  users,
+} from "./db/schema";
 import type { ServerConfig } from "./config";
 import { ApiError, Errors } from "./errors";
-import type { Dialog, EventPayloads, EventType, Message, SyncEvent, UserSummary } from "../src/shared/types";
+import type {
+  Dialog,
+  EventPayloads,
+  EventType,
+  GroupInfo,
+  Message,
+  Presence,
+  Reaction,
+  SecretInfo,
+  ServiceAction,
+  SyncEvent,
+  UserSummary,
+} from "../src/shared/types";
 import { isBlank, isUuid, previewText } from "../src/shared/text";
 import { activityDate, compareDialogs } from "../src/shared/dialogOrder";
+import { MAX_GROUP_MEMBERS, REACTIONS, groupIdOf, groupPeer, peerKind, secretIdOf, secretPeer } from "../src/shared/peer";
 
 type UserRow = typeof users.$inferSelect;
 type MessageRow = typeof messages.$inferSelect;
 type DialogRow = typeof dialogs.$inferSelect;
+type GroupRow = typeof groups.$inferSelect;
+type SecretRow = typeof secretChats.$inferSelect;
+
+type Chat =
+  | { kind: "user"; peerId: number; user: UserRow }
+  | { kind: "group"; peerId: number; group: GroupRow }
+  | { kind: "secret"; peerId: number; secret: SecretRow; other: UserRow };
 
 export interface PushedEvent {
   userId: number;
@@ -28,7 +64,12 @@ export interface PushedEvent {
 export type Pusher = (events: PushedEvent[]) => void;
 
 const USERNAME_RE = /^[A-Za-z0-9_]{3,32}$/;
+/** Deliberately loose: something@something.tld, no spaces. */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_IDS = 100;
+/** Secret-chat payloads: "e1:" + base64(iv) + ":" + base64(AES-GCM ciphertext). */
+const CIPHER_RE = /^e1:[A-Za-z0-9+/]+={0,2}:[A-Za-z0-9+/]+={0,2}$/;
+const DELETED_NAME = "Deleted account";
 
 function conv(a: number, b: number): [number, number] {
   return a < b ? [a, b] : [b, a];
@@ -41,6 +82,8 @@ function isInt(v: unknown): v is number {
 export class Relay {
   /** Called after each committed write with the events appended, in commit order. */
   pusher: Pusher = () => {};
+  /** Whether a user has an open socket; set by the hub. */
+  isOnline: (userId: number) => boolean = () => false;
   private collected: PushedEvent[] | null = null;
   private sendLog = new Map<number, number[]>();
 
@@ -140,35 +183,70 @@ export class Relay {
     for (const key of keys) this.authLog.set(key, [...this.recentAuth(key), now]);
   }
 
-  async register(input: { username?: unknown; displayName?: unknown; password?: unknown }, ip = "unknown") {
-    // Every registration attempt counts against the caller's IP.
-    this.throttle([{ key: "reg:" + ip, max: this.cfg.registerMaxPerIp }]);
-    this.recordAuth(["reg:" + ip]);
-    const { username, displayName, password } = input;
-    if (typeof username !== "string" || !USERNAME_RE.test(username)) {
-      throw Errors.validation("Usernames are 3-32 letters, digits or underscores.");
-    }
+  private validateDisplayName(displayName: unknown): string {
     if (typeof displayName !== "string" || displayName.trim().length < 1 || displayName.trim().length > 64) {
       throw Errors.validation("Display names are 1-64 characters.");
     }
+    return displayName.trim();
+  }
+
+  private validatePassword(password: unknown): string {
     if (typeof password !== "string" || password.length < 6 || password.length > 200) {
       throw Errors.validation("Passwords need at least 6 characters.");
     }
+    return password;
+  }
+
+  private validateEmail(email: unknown): string {
+    if (typeof email !== "string" || email.trim().length > 254 || !EMAIL_RE.test(email.trim())) {
+      throw Errors.validation("Enter a valid email address.");
+    }
+    return email.trim();
+  }
+
+  private emailTaken(lower: string, exceptUserId?: number): boolean {
+    const row = this.db.select({ id: users.id }).from(users).where(eq(users.emailLower, lower)).get();
+    return !!row && row.id !== exceptUserId;
+  }
+
+  async register(input: { username?: unknown; email?: unknown; displayName?: unknown; password?: unknown }, ip = "unknown") {
+    // Every registration attempt counts against the caller's IP.
+    this.throttle([{ key: "reg:" + ip, max: this.cfg.registerMaxPerIp }]);
+    this.recordAuth(["reg:" + ip]);
+    const { username } = input;
+    if (typeof username !== "string" || !USERNAME_RE.test(username)) {
+      throw Errors.validation("Usernames are 3-32 letters, digits or underscores.");
+    }
+    const email = this.validateEmail(input.email);
+    const displayName = this.validateDisplayName(input.displayName);
+    const password = this.validatePassword(input.password);
     const lower = username.toLowerCase();
+    const emailLower = email.toLowerCase();
     const taken = this.db.select({ id: users.id }).from(users).where(eq(users.usernameLower, lower)).get();
     if (taken) throw new ApiError(409, "USERNAME_TAKEN", "That username is already in use.");
+    if (this.emailTaken(emailLower)) throw Errors.emailTaken();
     const passwordHash = await bcrypt.hash(password, this.cfg.bcryptCost);
     try {
       const row = this.db
         .insert(users)
-        .values({ username, usernameLower: lower, displayName: displayName.trim(), passwordHash, createdAt: this.now() })
+        .values({ username, usernameLower: lower, email, emailLower, displayName, passwordHash, createdAt: this.now() })
         .returning()
         .get();
       return { user: this.summary(row), sessionId: this.createSession(row.id) };
     } catch (e) {
+      // Two sign-ups racing for the same name or email: the unique index decides.
+      if (String(e).includes("email_lower")) throw Errors.emailTaken();
       if (String(e).includes("UNIQUE")) throw new ApiError(409, "USERNAME_TAKEN", "That username is already in use.");
       throw e;
     }
+  }
+
+  private async passwordMatches(row: UserRow | undefined, password: string): Promise<boolean> {
+    // Compare against a dummy hash for unknown or deleted users so timing does not reveal existence.
+    if (!this.dummyHash) this.dummyHash = await bcrypt.hash("relay-dummy-password", this.cfg.bcryptCost);
+    const usable = row && row.deletedAt == null;
+    const ok = await bcrypt.compare(password, usable ? row.passwordHash : this.dummyHash);
+    return !!usable && ok;
   }
 
   async login(input: { username?: unknown; password?: unknown }, ip = "unknown") {
@@ -182,11 +260,13 @@ export class Relay {
       this.recordAuth(keys);
       throw bad;
     }
-    const row = this.db.select().from(users).where(eq(users.usernameLower, lower)).get();
-    // Compare against a dummy hash for unknown users so timing does not reveal existence.
-    if (!this.dummyHash) this.dummyHash = await bcrypt.hash("relay-dummy-password", this.cfg.bcryptCost);
-    const ok = await bcrypt.compare(input.password, row?.passwordHash ?? this.dummyHash);
-    if (!row || !ok) {
+    // The sign-in name can be the username or the email address.
+    const row = this.db
+      .select()
+      .from(users)
+      .where(lower.includes("@") ? eq(users.emailLower, lower) : eq(users.usernameLower, lower))
+      .get();
+    if (!(await this.passwordMatches(row, input.password)) || !row) {
       this.recordAuth(keys);
       throw bad;
     }
@@ -209,7 +289,7 @@ export class Relay {
       .innerJoin(users, eq(users.id, sessions.userId))
       .where(eq(sessions.id, sessionId))
       .get();
-    if (!row) return null;
+    if (!row || row.user.deletedAt != null) return null;
     if (row.expiresAt < this.now()) {
       this.db.delete(sessions).where(eq(sessions.id, sessionId)).run();
       return null;
@@ -223,8 +303,186 @@ export class Relay {
 
   me(userId: number) {
     const row = this.db.select().from(users).where(eq(users.id, userId)).get();
-    if (!row) throw Errors.unauthorized();
-    return { user: this.summary(row), seq: row.currentSeq, serverTime: this.now() };
+    if (!row || row.deletedAt != null) throw Errors.unauthorized();
+    // The email is private: it is only ever returned to its owner, never in UserSummary.
+    return { user: this.summary(row), email: row.email ?? null, seq: row.currentSeq, serverTime: this.now() };
+  }
+
+  /** Adds or changes the account email (needed for accounts created before emails existed). */
+  updateEmail(me: number, body: { email?: unknown }) {
+    const email = this.validateEmail(body.email);
+    const emailLower = email.toLowerCase();
+    if (this.emailTaken(emailLower, me)) throw Errors.emailTaken();
+    try {
+      this.db.update(users).set({ email, emailLower }).where(eq(users.id, me)).run();
+    } catch (e) {
+      if (String(e).includes("UNIQUE")) throw Errors.emailTaken();
+      throw e;
+    }
+    return { email };
+  }
+
+  // ---------------------------------------------------------------- profile & account
+
+  /** Users who show this user's name or presence somewhere: direct and secret partners, group co-members. */
+  private contactsOf(userId: number): number[] {
+    const out = new Set<number>();
+    for (const r of this.db.select({ o: dialogs.ownerId }).from(dialogs).where(eq(dialogs.peerId, userId)).all()) out.add(r.o);
+    for (const s of this.db
+      .select()
+      .from(secretChats)
+      .where(or(eq(secretChats.initiatorId, userId), eq(secretChats.responderId, userId)))
+      .all()) {
+      out.add(s.initiatorId === userId ? s.responderId : s.initiatorId);
+    }
+    const mine = this.db.select({ g: groupMembers.groupId }).from(groupMembers).where(eq(groupMembers.userId, userId)).all();
+    if (mine.length) {
+      for (const r of this.db
+        .select({ u: groupMembers.userId })
+        .from(groupMembers)
+        .where(inArray(groupMembers.groupId, mine.map((m) => m.g)))
+        .all()) {
+        out.add(r.u);
+      }
+    }
+    out.delete(userId);
+    return [...out];
+  }
+
+  updateProfile(me: number, body: { displayName?: unknown }) {
+    const displayName = this.validateDisplayName(body.displayName);
+    const row = this.user(me)!;
+    if (row.displayName === displayName) return { user: this.summary(row), seq: this.currentSeq(me) };
+    const user = this.write(() => {
+      const updated = this.db.update(users).set({ displayName }).where(eq(users.id, me)).returning().get();
+      const summary = this.summary(updated);
+      this.emit(me, "me.updated", { user: summary });
+      for (const u of this.contactsOf(me)) this.emit(u, "peer.updated", { user: summary, deleted: false });
+      return summary;
+    });
+    return { user, seq: this.currentSeq(me) };
+  }
+
+  /** Returns the ids of the other sessions it ended so their sockets can be closed. */
+  async changePassword(me: number, sessionId: string | undefined, body: { currentPassword?: unknown; newPassword?: unknown }) {
+    if (typeof body.currentPassword !== "string" || !(await this.passwordMatches(this.user(me), body.currentPassword))) {
+      throw new ApiError(403, "WRONG_PASSWORD", "Your current password is not right.");
+    }
+    const next = this.validatePassword(body.newPassword);
+    const passwordHash = await bcrypt.hash(next, this.cfg.bcryptCost);
+    this.db.update(users).set({ passwordHash }).where(eq(users.id, me)).run();
+    const others = this.db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(and(eq(sessions.userId, me), sessionId ? ne(sessions.id, sessionId) : undefined))
+      .all()
+      .map((r) => r.id);
+    if (others.length) this.db.delete(sessions).where(inArray(sessions.id, others)).run();
+    return { endedSessions: others };
+  }
+
+  /**
+   * Deletes an account: the name becomes "Deleted account", sign-in stops working, the user
+   * leaves every group and drops their secret-chat keys. Messages stay for the other side.
+   */
+  async deleteAccount(me: number, body: { password?: unknown }) {
+    if (typeof body.password !== "string" || !(await this.passwordMatches(this.user(me), body.password))) {
+      throw new ApiError(403, "WRONG_PASSWORD", "Your password is not right.");
+    }
+    const ended = this.db.select({ id: sessions.id }).from(sessions).where(eq(sessions.userId, me)).all().map((r) => r.id);
+    this.write(() => {
+      const contacts = this.contactsOf(me);
+      for (const g of this.db.select({ g: groupMembers.groupId }).from(groupMembers).where(eq(groupMembers.userId, me)).all()) {
+        const group = this.db.select().from(groups).where(eq(groups.id, g.g)).get();
+        if (group) this.leaveGroupTx(me, { kind: "group", peerId: groupPeer(group.id), group });
+      }
+      const name = `deleted_${me}`;
+      const updated = this.db
+        .update(users)
+        // The email is released so it can be used for a new account.
+        .set({
+          deletedAt: this.now(),
+          displayName: DELETED_NAME,
+          username: name,
+          usernameLower: name,
+          email: null,
+          emailLower: null,
+          passwordHash: "!",
+        })
+        .where(eq(users.id, me))
+        .returning()
+        .get();
+      this.db.delete(sessions).where(eq(sessions.userId, me)).run();
+      this.db.delete(userKeys).where(eq(userKeys.userId, me)).run();
+      for (const u of contacts) this.emit(u, "peer.updated", { user: this.summary(updated), deleted: true });
+    });
+    return { endedSessions: ended };
+  }
+
+  // ---------------------------------------------------------------- blocking & presence
+
+  private isBlocked(blockerId: number, blockedId: number): boolean {
+    return !!this.db
+      .select({ x: blocks.blockerId })
+      .from(blocks)
+      .where(and(eq(blocks.blockerId, blockerId), eq(blocks.blockedId, blockedId)))
+      .get();
+  }
+
+  setBlocked(me: number, userIdRaw: unknown, blocked: unknown) {
+    if (!isInt(userIdRaw) || userIdRaw === me || !this.user(userIdRaw)) throw Errors.peerInvalid();
+    if (typeof blocked !== "boolean") throw Errors.validation("blocked must be a boolean.");
+    const userId = userIdRaw;
+    if (this.isBlocked(me, userId) !== blocked) {
+      this.write(() => {
+        if (blocked) this.db.insert(blocks).values({ blockerId: me, blockedId: userId, createdAt: this.now() }).run();
+        else this.db.delete(blocks).where(and(eq(blocks.blockerId, me), eq(blocks.blockedId, userId))).run();
+        this.emit(me, "user.blocked", { userId, blocked });
+      });
+    }
+    return { blocked, seq: this.currentSeq(me) };
+  }
+
+  /** What `viewer` may know about `userId`: nothing when blocked by them or when the account is gone. */
+  presence(viewer: number, userId: number): Presence {
+    const u = this.user(userId);
+    if (!u || u.deletedAt != null || this.isBlocked(userId, viewer)) return { online: false, lastSeen: null };
+    return { online: this.isOnline(userId), lastSeen: u.lastSeenAt ?? null };
+  }
+
+  presenceMany(viewer: number, idsRaw: string | null) {
+    const ids = (idsRaw ?? "")
+      .split(",")
+      .map((s) => Number(s))
+      .filter((n) => Number.isInteger(n) && n > 0)
+      .slice(0, 200);
+    const out: Record<number, Presence> = {};
+    for (const id of new Set(ids)) out[id] = this.presence(viewer, id);
+    return { presence: out };
+  }
+
+  /** Who should hear about this user's online state changes. */
+  presenceWatchers(userId: number): number[] {
+    return this.contactsOf(userId).filter((u) => !this.isBlocked(userId, u));
+  }
+
+  touchLastSeen(userId: number): void {
+    this.db.update(users).set({ lastSeenAt: this.now() }).where(eq(users.id, userId)).run();
+  }
+
+  /** Recipients of a typing notice and the peer id each of them knows the chat by. */
+  typingTargets(me: number, peerId: unknown): { userId: number; peerId: number }[] {
+    let chat: Chat;
+    try {
+      chat = this.chat(me, peerId);
+    } catch {
+      return [];
+    }
+    const other = this.otherUser(chat);
+    if (other && (other.deletedAt != null || this.isBlocked(other.id, me) || this.isBlocked(me, other.id))) return [];
+    return this.membersOf(chat, me)
+      .filter((u) => u !== me)
+      .map((u) => ({ userId: u, peerId: this.viewerPeer(chat, me, u) }));
   }
 
   // ---------------------------------------------------------------- helpers
@@ -237,16 +495,97 @@ export class Relay {
     return this.db.select().from(users).where(eq(users.id, id)).get();
   }
 
-  private requirePeer(me: number, peerId: unknown): UserRow {
-    if (!isInt(peerId) || peerId === me) throw Errors.peerInvalid();
-    const peer = this.user(peerId);
-    if (!peer) throw Errors.peerInvalid();
-    return peer;
+  private isMember(groupId: number, userId: number): boolean {
+    return !!this.db
+      .select({ x: groupMembers.userId })
+      .from(groupMembers)
+      .where(and(eq(groupMembers.groupId, groupId), eq(groupMembers.userId, userId)))
+      .get();
   }
 
-  private inConv(a: number, b: number): SQL {
-    const [lo, hi] = conv(a, b);
-    return and(eq(messages.convLow, lo), eq(messages.convHigh, hi))!;
+  private memberIds(groupId: number): number[] {
+    return this.db
+      .select({ u: groupMembers.userId })
+      .from(groupMembers)
+      .where(eq(groupMembers.groupId, groupId))
+      .orderBy(asc(groupMembers.joinedAt), asc(groupMembers.userId))
+      .all()
+      .map((r) => r.u);
+  }
+
+  /** Resolves a peer id the caller may use; anything else is PEER_INVALID. */
+  private chat(me: number, peerId: unknown): Chat {
+    if (!isInt(peerId) || peerId === me || peerId === 0) throw Errors.peerInvalid();
+    const kind = peerKind(peerId);
+    if (kind === "user") {
+      const user = this.user(peerId);
+      if (!user) throw Errors.peerInvalid();
+      return { kind, peerId, user };
+    }
+    if (kind === "group") {
+      const group = this.db.select().from(groups).where(eq(groups.id, groupIdOf(peerId))).get();
+      if (!group || !this.isMember(group.id, me)) throw Errors.peerInvalid();
+      return { kind, peerId, group };
+    }
+    const secret = this.db.select().from(secretChats).where(eq(secretChats.id, secretIdOf(peerId))).get();
+    if (!secret || (secret.initiatorId !== me && secret.responderId !== me)) throw Errors.peerInvalid();
+    const other = this.user(secret.initiatorId === me ? secret.responderId : secret.initiatorId);
+    if (!other) throw Errors.peerInvalid();
+    return { kind, peerId, secret, other };
+  }
+
+  private otherUser(chat: Chat): UserRow | null {
+    return chat.kind === "user" ? chat.user : chat.kind === "secret" ? chat.other : null;
+  }
+
+  private membersOf(chat: Chat, me: number): number[] {
+    if (chat.kind === "user") return [me, chat.user.id];
+    if (chat.kind === "group") return this.memberIds(chat.group.id);
+    return [chat.secret.initiatorId, chat.secret.responderId];
+  }
+
+  /** The peer id `viewer` knows `chat` by, where `me` is the caller who resolved it. */
+  private viewerPeer(chat: Chat, me: number, viewer: number): number {
+    if (chat.kind === "user") return viewer === me ? chat.user.id : me;
+    return chat.peerId;
+  }
+
+  private chatCond(chat: Chat, me: number): SQL {
+    if (chat.kind === "user") {
+      const [lo, hi] = conv(me, chat.user.id);
+      return and(eq(messages.convLow, lo), eq(messages.convHigh, hi), isNull(messages.chatId))!;
+    }
+    return eq(messages.chatId, chat.peerId);
+  }
+
+  private inChat(m: MessageRow, chat: Chat, me: number): boolean {
+    if (chat.kind === "user") {
+      const [lo, hi] = conv(me, chat.user.id);
+      return m.chatId == null && m.convLow === lo && m.convHigh === hi;
+    }
+    return m.chatId === chat.peerId;
+  }
+
+  /** Column values that place a new message in `chat`. */
+  private address(chat: Chat, me: number) {
+    if (chat.kind === "group") return { convLow: 0, convHigh: 0, chatId: chat.peerId, recipientId: null };
+    const other = this.otherUser(chat)!;
+    const [lo, hi] = conv(me, other.id);
+    return { convLow: lo, convHigh: hi, chatId: chat.kind === "secret" ? chat.peerId : null, recipientId: other.id };
+  }
+
+  /** The peer id `viewer` knows the message's chat by. */
+  private msgPeer(m: MessageRow, viewer: number): number {
+    if (m.chatId != null) return m.chatId;
+    return m.senderId === viewer ? m.recipientId! : m.senderId;
+  }
+
+  /** Everyone currently in the message's chat. */
+  private audience(m: MessageRow): number[] {
+    if (m.chatId == null) return [m.senderId, m.recipientId!];
+    if (peerKind(m.chatId) === "group") return this.memberIds(groupIdOf(m.chatId));
+    const s = this.db.select().from(secretChats).where(eq(secretChats.id, secretIdOf(m.chatId))).get();
+    return s ? [s.initiatorId, s.responderId] : [];
   }
 
   private visibleTo(userId: number): SQL {
@@ -257,8 +596,12 @@ export class Relay {
   }
 
   private isVisible(m: MessageRow, userId: number): boolean {
-    if (m.senderId !== userId && m.recipientId !== userId) return false;
     if (m.deletedForEveryoneAt != null) return false;
+    if (m.chatId == null) {
+      if (m.senderId !== userId && m.recipientId !== userId) return false;
+    } else if (!this.audience(m).includes(userId)) {
+      return false;
+    }
     const hidden = this.db
       .select({ x: messageHidden.messageId })
       .from(messageHidden)
@@ -279,22 +622,39 @@ export class Relay {
     return m.fwdFromName ?? "";
   }
 
+  private reactionsFor(messageId: number, viewerId: number): Reaction[] {
+    const rows = this.db.select().from(messageReactions).where(eq(messageReactions.messageId, messageId)).all();
+    if (rows.length === 0) return [];
+    const by = new Map<string, Reaction>();
+    for (const r of rows) {
+      const cur = by.get(r.emoji) ?? { emoji: r.emoji, count: 0, mine: false };
+      cur.count++;
+      if (r.userId === viewerId) cur.mine = true;
+      by.set(r.emoji, cur);
+    }
+    const order = REACTIONS as readonly string[];
+    return [...by.values()].sort((a, b) => order.indexOf(a.emoji) - order.indexOf(b.emoji));
+  }
+
   /** Viewer-relative wire message (spec 4.2). */
   wireMessage(m: MessageRow, viewerId: number): Message {
     const out = m.senderId === viewerId;
+    const secret = m.chatId != null && peerKind(m.chatId) === "secret";
     let replyTo: Message["replyTo"] = null;
     if (m.replyToId != null) {
       const orig = this.getMessage(m.replyToId);
       if (orig && this.isVisible(orig, viewerId)) {
         const senderName = orig.fwdFromDate != null ? this.forwardName(orig) : (this.user(orig.senderId)?.displayName ?? "");
-        replyTo = { id: orig.id, deleted: false, senderId: orig.senderId, senderName, snippet: previewText(orig.text) };
+        // Secret chats: the snippet is the whole ciphertext; the client decrypts and shortens it.
+        const snippet = secret ? orig.text : previewText(orig.text);
+        replyTo = { id: orig.id, deleted: false, senderId: orig.senderId, senderName, snippet };
       } else {
         replyTo = { id: m.replyToId, deleted: true };
       }
     }
     const msg: Message = {
       id: m.id,
-      peerId: out ? m.recipientId : m.senderId,
+      peerId: this.msgPeer(m, viewerId),
       senderId: m.senderId,
       out,
       text: m.text,
@@ -303,7 +663,10 @@ export class Relay {
       replyTo,
       forwardedFrom:
         m.fwdFromDate != null ? { userId: m.fwdFromUserId ?? null, name: this.forwardName(m), date: m.fwdFromDate } : null,
+      reactions: this.reactionsFor(m.id, viewerId),
+      service: m.service ? (JSON.parse(m.service) as ServiceAction) : null,
     };
+    if (m.chatId != null) msg.senderName = this.user(m.senderId)?.displayName ?? "";
     if (out) msg.clientToken = m.clientToken;
     return msg;
   }
@@ -329,43 +692,88 @@ export class Relay {
     }
   }
 
-  private topMessage(ownerId: number, peerId: number): MessageRow | undefined {
+  private topMessage(ownerId: number, chat: Chat): MessageRow | undefined {
     return this.db
       .select()
       .from(messages)
-      .where(and(this.inConv(ownerId, peerId), this.visibleTo(ownerId)))
+      .where(and(this.chatCond(chat, ownerId), this.visibleTo(ownerId)))
       .orderBy(desc(messages.id))
       .limit(1)
       .get();
   }
 
-  private unreadCount(ownerId: number, peerId: number, cursor: number): number {
+  private unreadCount(ownerId: number, chat: Chat, cursor: number): number {
     const r = this.db
       .select({ n: sql<number>`count(*)` })
       .from(messages)
       .where(
-        and(this.inConv(ownerId, peerId), this.visibleTo(ownerId), eq(messages.senderId, peerId), gt(messages.id, cursor)),
+        and(this.chatCond(chat, ownerId), this.visibleTo(ownerId), ne(messages.senderId, ownerId), gt(messages.id, cursor)),
       )
       .get();
     return Number(r?.n ?? 0);
   }
 
-  private dialogView(ownerId: number, peer: UserRow, row: DialogRow | undefined): Dialog & { touchedAt: number } {
-    const top = this.topMessage(ownerId, peer.id);
+  /** Highest read cursor among the other participants (groups: read by anyone). */
+  private outboxCursor(me: number, chat: Chat): number {
+    if (chat.kind === "user") return this.dialogRow(chat.user.id, me)?.readInboxMaxId ?? 0;
+    const r = this.db
+      .select({ m: sql<number | null>`max(${dialogs.readInboxMaxId})` })
+      .from(dialogs)
+      .where(and(eq(dialogs.peerId, chat.peerId), ne(dialogs.ownerId, me)))
+      .get();
+    return Number(r?.m ?? 0);
+  }
+
+  private groupInfo(g: GroupRow): GroupInfo {
+    const ids = this.memberIds(g.id);
+    const rows = ids.length ? this.db.select().from(users).where(inArray(users.id, ids)).all() : [];
+    const byId = new Map(rows.map((u) => [u.id, u]));
+    return {
+      id: g.id,
+      title: g.title,
+      ownerId: g.ownerId,
+      members: ids.map((id) => byId.get(id)).filter((u): u is UserRow => !!u).map((u) => this.summary(u)),
+    };
+  }
+
+  private secretInfo(s: SecretRow, me: number): SecretInfo {
+    return {
+      id: s.id,
+      userId: s.initiatorId === me ? s.responderId : s.initiatorId,
+      initiatorId: s.initiatorId,
+      initiatorKey: s.initiatorKey,
+      responderKey: s.responderKey,
+    };
+  }
+
+  private peerSummary(chat: Chat): UserSummary {
+    if (chat.kind === "group") return { id: chat.peerId, username: "", displayName: chat.group.title };
+    const u = this.otherUser(chat)!;
+    return { ...this.summary(u), id: chat.peerId };
+  }
+
+  private dialogView(ownerId: number, chat: Chat, row: DialogRow | undefined): Dialog & { touchedAt: number } {
+    const top = this.topMessage(ownerId, chat);
     const cursor = row?.readInboxMaxId ?? 0;
     const draft = row?.draftText ? { text: row.draftText, date: row.draftUpdatedAt ?? 0 } : null;
-    const peerRow = this.dialogRow(peer.id, ownerId);
+    const other = this.otherUser(chat);
     return {
-      peer: this.summary(peer),
+      kind: chat.kind,
+      peer: this.peerSummary(chat),
       topMessage: top ? this.wireMessage(top, ownerId) : null,
-      unreadCount: this.unreadCount(ownerId, peer.id, cursor),
+      unreadCount: this.unreadCount(ownerId, chat, cursor),
       unreadMark: row?.unreadMark ?? false,
       pinned: row?.pinned ?? false,
       pinOrder: row?.pinned ? (row.pinOrder ?? 0) : null,
       draft,
       readInboxMaxId: cursor,
-      readOutboxMaxId: peerRow?.readInboxMaxId ?? 0,
+      readOutboxMaxId: this.outboxCursor(ownerId, chat),
       activityDate: activityDate(top?.createdAt, draft),
+      group: chat.kind === "group" ? this.groupInfo(chat.group) : null,
+      secret: chat.kind === "secret" ? this.secretInfo(chat.secret, ownerId) : null,
+      blocked: other ? this.isBlocked(ownerId, other.id) : false,
+      peerDeleted: other ? other.deletedAt != null : false,
+      presence: other ? this.presence(ownerId, other.id) : null,
       touchedAt: row?.touchedAt ?? 0,
     };
   }
@@ -387,6 +795,7 @@ export class Relay {
       .where(
         and(
           ne(users.id, me),
+          isNull(users.deletedAt),
           or(sql`${users.usernameLower} like ${esc} escape '\\'`, sql`lower(${users.displayName}) like ${esc} escape '\\'`),
         ),
       )
@@ -404,17 +813,16 @@ export class Relay {
     const rows = this.db.select().from(dialogs).where(eq(dialogs.ownerId, me)).all();
     const views: (Dialog & { touchedAt: number })[] = [];
     for (const row of rows) {
-      const peer = this.user(row.peerId);
-      if (!peer) continue;
+      let chat: Chat;
+      try {
+        chat = this.chat(me, row.peerId);
+      } catch {
+        continue;
+      }
       const hasDraft = !!row.draftText;
-      const anyMessage = this.db
-        .select({ id: messages.id })
-        .from(messages)
-        .where(this.inConv(me, row.peerId))
-        .limit(1)
-        .get();
+      const anyMessage = this.db.select({ id: messages.id }).from(messages).where(this.chatCond(chat, me)).limit(1).get();
       if (!anyMessage && !hasDraft && !row.pinned) continue; // BR-LIST-14
-      views.push(this.dialogView(me, peer, row));
+      views.push(this.dialogView(me, chat, row));
     }
     views.sort((a, b) => compareDialogs({ ...a, peerId: a.peer.id }, { ...b, peerId: b.peer.id }));
     const pinnedCount = views.filter((v) => v.pinned).length;
@@ -426,8 +834,8 @@ export class Relay {
   }
 
   getDialog(me: number, peerId: unknown) {
-    const peer = this.requirePeer(me, peerId);
-    return { dialog: this.strip(this.dialogView(me, peer, this.dialogRow(me, peer.id))), seq: this.currentSeq(me) };
+    const chat = this.chat(me, peerId);
+    return { dialog: this.strip(this.dialogView(me, chat, this.dialogRow(me, chat.peerId))), seq: this.currentSeq(me) };
   }
 
   private pinnedOrder(me: number): number[] {
@@ -461,21 +869,21 @@ export class Relay {
 
   /** H4 */
   setPinned(me: number, peerId: unknown, pinned: unknown) {
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
     if (typeof pinned !== "boolean") throw Errors.validation("pinned must be a boolean.");
     const order = this.pinnedOrder(me);
-    const has = order.includes(peer.id);
+    const has = order.includes(chat.peerId);
     if (pinned && !has) {
       if (order.length >= this.cfg.pinLimit) {
         throw new ApiError(400, "PIN_LIMIT", `You can pin up to ${this.cfg.pinLimit} conversations.`);
       }
-      const next = [peer.id, ...order];
+      const next = [chat.peerId, ...order];
       this.write(() => this.writePinnedOrder(me, next, null));
       return { pinnedOrder: next, seq: this.currentSeq(me) };
     }
     if (!pinned && has) {
-      const next = order.filter((p) => p !== peer.id);
-      this.write(() => this.writePinnedOrder(me, next, peer.id));
+      const next = order.filter((p) => p !== chat.peerId);
+      this.write(() => this.writePinnedOrder(me, next, chat.peerId));
       return { pinnedOrder: next, seq: this.currentSeq(me) };
     }
     return { pinnedOrder: order, seq: this.currentSeq(me) };
@@ -496,30 +904,31 @@ export class Relay {
 
   /** H6 */
   setUnreadMark(me: number, peerId: unknown, marked: unknown) {
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
     if (typeof marked !== "boolean") throw Errors.validation("marked must be a boolean.");
-    const row = this.dialogRow(me, peer.id);
+    const row = this.dialogRow(me, chat.peerId);
     if ((row?.unreadMark ?? false) !== marked) {
       this.write(() => {
-        this.ensureDialog(me, peer.id, false);
+        this.ensureDialog(me, chat.peerId, false);
         this.db
           .update(dialogs)
           .set({ unreadMark: marked })
-          .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, peer.id)))
+          .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, chat.peerId)))
           .run();
-        this.emit(me, "dialog.unreadMark", { peerId: peer.id, marked });
+        this.emit(me, "dialog.unreadMark", { peerId: chat.peerId, marked });
       });
     }
     return { seq: this.currentSeq(me) };
   }
 
-  /** H7 */
+  /** H7. Secret chats keep drafts on the device only (the server would see plain text). */
   setDraft(me: number, peerId: unknown, text: unknown) {
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
+    if (chat.kind === "secret") throw new ApiError(400, "DRAFT_NOT_ALLOWED", "Drafts of secret chats stay on your device.");
     if (typeof text !== "string") throw Errors.validation("text must be a string.");
     if (text.length > this.cfg.maxTextLen) throw Errors.messageTooLong(this.cfg.maxTextLen);
     const next = isBlank(text) ? null : text;
-    const row = this.dialogRow(me, peer.id);
+    const row = this.dialogRow(me, chat.peerId);
     const prev = row?.draftText ?? null;
     if (prev === next) {
       const draft = prev ? { text: prev, date: row?.draftUpdatedAt ?? 0 } : null;
@@ -528,40 +937,42 @@ export class Relay {
     const now = this.now();
     const draft = next ? { text: next, date: now } : null;
     this.write(() => {
-      this.ensureDialog(me, peer.id, true);
+      this.ensureDialog(me, chat.peerId, true);
       this.db
         .update(dialogs)
         .set({ draftText: next, draftUpdatedAt: next ? now : null, touchedAt: now })
-        .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, peer.id)))
+        .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, chat.peerId)))
         .run();
-      this.emit(me, "dialog.draft", { peerId: peer.id, draft });
+      this.emit(me, "dialog.draft", { peerId: chat.peerId, draft });
     });
     return { draft, seq: this.currentSeq(me) };
   }
 
   /** H8, BR-READ-9 / BR-STATUS-5 */
   markRead(me: number, peerId: unknown, maxIdRaw: unknown) {
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
     if (!isInt(maxIdRaw) || maxIdRaw < 0) throw Errors.validation("maxId must be a non-negative integer.");
-    const row = this.dialogRow(me, peer.id);
+    const row = this.dialogRow(me, chat.peerId);
     const cursor = row?.readInboxMaxId ?? 0;
-    const newest = this.topMessage(me, peer.id)?.id ?? 0;
+    const newest = this.topMessage(me, chat)?.id ?? 0;
     const target = Math.min(maxIdRaw, newest);
     if (target > cursor) {
       return this.write(() => {
-        this.ensureDialog(me, peer.id, false);
+        this.ensureDialog(me, chat.peerId, false);
         this.db
           .update(dialogs)
           .set({ readInboxMaxId: target })
-          .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, peer.id)))
+          .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, chat.peerId)))
           .run();
-        const unreadCount = this.unreadCount(me, peer.id, target);
-        this.emit(me, "read.inbox", { peerId: peer.id, maxId: target, unreadCount });
-        this.emit(peer.id, "read.outbox", { peerId: me, maxId: target });
+        const unreadCount = this.unreadCount(me, chat, target);
+        this.emit(me, "read.inbox", { peerId: chat.peerId, maxId: target, unreadCount });
+        for (const u of this.membersOf(chat, me)) {
+          if (u !== me) this.emit(u, "read.outbox", { peerId: this.viewerPeer(chat, me, u), maxId: target });
+        }
         return { readInboxMaxId: target, unreadCount, seq: this.currentSeq(me) };
       });
     }
-    return { readInboxMaxId: cursor, unreadCount: this.unreadCount(me, peer.id, cursor), seq: this.currentSeq(me) };
+    return { readInboxMaxId: cursor, unreadCount: this.unreadCount(me, chat, cursor), seq: this.currentSeq(me) };
   }
 
   // ---------------------------------------------------------------- H9 history
@@ -571,10 +982,10 @@ export class Relay {
     peerId: unknown,
     q: { before?: number | null; after?: number | null; around?: number | null; limit?: number | null },
   ) {
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
     let limit = isInt(q.limit) ? q.limit : 40;
     limit = Math.max(1, Math.min(100, limit));
-    const base = and(this.inConv(me, peer.id), this.visibleTo(me))!;
+    const base = and(this.chatCond(chat, me), this.visibleTo(me))!;
     const pick = (cond: SQL | undefined, order: "asc" | "desc", n: number) =>
       n <= 0
         ? []
@@ -593,7 +1004,7 @@ export class Relay {
         const exists = this.db
           .select({ id: messages.id })
           .from(messages)
-          .where(and(eq(messages.id, around), this.inConv(me, peer.id)))
+          .where(and(eq(messages.id, around), this.chatCond(chat, me)))
           .get();
         if (!exists) throw Errors.messageNotFound();
       }
@@ -646,10 +1057,25 @@ export class Relay {
     this.sendLog.set(me, log);
   }
 
-  private validateText(text: unknown): string {
+  private validateText(text: unknown, chat?: Chat): string {
+    if (chat?.kind === "secret") {
+      // The server never sees secret-chat plain text: only well-formed ciphertext is accepted.
+      if (typeof text !== "string" || !CIPHER_RE.test(text) || text.length > this.cfg.maxTextLen * 4 + 256) {
+        throw new ApiError(400, "CIPHERTEXT_INVALID", "Secret chat messages must be encrypted on your device.");
+      }
+      return text;
+    }
     if (typeof text !== "string" || isBlank(text)) throw Errors.messageEmpty();
     if (text.length > this.cfg.maxTextLen) throw Errors.messageTooLong(this.cfg.maxTextLen);
     return text;
+  }
+
+  /** Sending into a one-to-one or secret chat needs a live account that has not blocked you. */
+  private assertCanMessage(me: number, chat: Chat): void {
+    const other = this.otherUser(chat);
+    if (!other) return;
+    if (other.deletedAt != null) throw new ApiError(403, "PEER_DELETED", "This account was deleted.");
+    if (this.isBlocked(other.id, me)) throw new ApiError(403, "BLOCKED", "You can't message this person.");
   }
 
   private byToken(me: number, token: string): MessageRow | undefined {
@@ -664,11 +1090,32 @@ export class Relay {
     return this.db.insert(messages).values(v).returning().get();
   }
 
-  private announceNew(m: MessageRow): void {
-    this.ensureDialog(m.senderId, m.recipientId, true);
-    this.ensureDialog(m.recipientId, m.senderId, true);
-    this.emit(m.senderId, "message.new", { message: this.wireMessage(m, m.senderId) });
-    this.emit(m.recipientId, "message.new", { message: this.wireMessage(m, m.recipientId) });
+  /** Creates dialogs and emits message.new to everyone in the chat; the sender first. */
+  private announceNew(m: MessageRow, afterSender?: () => void): void {
+    const audience = this.audience(m);
+    const ordered = [m.senderId, ...audience.filter((u) => u !== m.senderId)];
+    for (const u of ordered) {
+      if (u === m.senderId && !audience.includes(u)) {
+        afterSender?.();
+        continue;
+      }
+      this.ensureDialog(u, this.msgPeer(m, u), true);
+      this.emit(u, "message.new", { message: this.wireMessage(m, u) });
+      if (u === m.senderId) afterSender?.();
+    }
+  }
+
+  private insertService(chat: Chat, me: number, action: ServiceAction): MessageRow {
+    const row = this.insertMessage({
+      ...this.address(chat, me),
+      senderId: me,
+      text: "",
+      service: JSON.stringify(action),
+      createdAt: this.now(),
+      clientToken: crypto.randomUUID(),
+    });
+    this.announceNew(row);
+    return row;
   }
 
   sendMessage(
@@ -682,14 +1129,14 @@ export class Relay {
     if (existing) {
       return { message: this.wireMessage(existing, me), seq: this.currentSeq(me), duplicate: true };
     }
-    const text = this.validateText(body.text);
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
+    const text = this.validateText(body.text, chat);
+    this.assertCanMessage(me, chat);
     let replyToId: number | null = null;
     if (body.replyToId != null) {
       if (!isInt(body.replyToId)) throw Errors.replyTargetInvalid();
       const target = this.getMessage(body.replyToId);
-      const [lo, hi] = conv(me, peer.id);
-      if (!target || target.convLow !== lo || target.convHigh !== hi || !this.isVisible(target, me)) {
+      if (!target || target.service || !this.inChat(target, chat, me) || !this.isVisible(target, me)) {
         throw Errors.replyTargetInvalid();
       }
       replyToId = target.id;
@@ -699,32 +1146,26 @@ export class Relay {
     const result = this.write(() => {
       const dup = this.byToken(me, token);
       if (dup) return { row: dup, duplicate: true };
-      const [lo, hi] = conv(me, peer.id);
       const row = this.insertMessage({
-        convLow: lo,
-        convHigh: hi,
+        ...this.address(chat, me),
         senderId: me,
-        recipientId: peer.id,
         text,
         createdAt: this.now(),
         replyToId,
         clientToken: token,
       });
-      this.ensureDialog(me, peer.id, true);
-      this.ensureDialog(peer.id, me, true);
-      this.emit(me, "message.new", { message: this.wireMessage(row, me) });
-      if (clearDraft) {
-        const d = this.dialogRow(me, peer.id);
+      this.announceNew(row, () => {
+        if (!clearDraft) return;
+        const d = this.dialogRow(me, chat.peerId);
         if (d?.draftText) {
           this.db
             .update(dialogs)
             .set({ draftText: null, draftUpdatedAt: null })
-            .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, peer.id)))
+            .where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, chat.peerId)))
             .run();
-          this.emit(me, "dialog.draft", { peerId: peer.id, draft: null });
+          this.emit(me, "dialog.draft", { peerId: chat.peerId, draft: null });
         }
-      }
-      this.emit(peer.id, "message.new", { message: this.wireMessage(row, peer.id) });
+      });
       return { row, duplicate: false };
     });
     if (!result.duplicate) this.recordSends(me, 1);
@@ -739,10 +1180,10 @@ export class Relay {
     if (replies.length === 0) return;
     const perUser = new Map<number, Map<number, number[]>>();
     for (const r of replies) {
-      for (const u of [r.senderId, r.recipientId]) {
+      for (const u of this.audience(r)) {
         if (onlyFor && !onlyFor.includes(u)) continue;
         if (!this.isVisible(r, u)) continue;
-        const peer = u === r.senderId ? r.recipientId : r.senderId;
+        const peer = this.msgPeer(r, u);
         const byPeer = perUser.get(u) ?? new Map<number, number[]>();
         byPeer.set(peer, [...(byPeer.get(peer) ?? []), r.id]);
         perUser.set(u, byPeer);
@@ -753,18 +1194,22 @@ export class Relay {
     }
   }
 
+  private messageChat(m: MessageRow, me: number): Chat {
+    return this.chat(me, this.msgPeer(m, me));
+  }
+
   // ---------------------------------------------------------------- H11 edit
 
   editMessage(me: number, idRaw: unknown, text: unknown) {
     if (!isInt(idRaw)) throw Errors.messageNotFound();
     const m = this.getMessage(idRaw);
     if (!m || !this.isVisible(m, me)) throw Errors.messageNotFound();
-    if (m.senderId !== me) throw new ApiError(403, "EDIT_NOT_ALLOWED", "Only your own messages can be edited.");
+    if (m.senderId !== me || m.service) throw new ApiError(403, "EDIT_NOT_ALLOWED", "Only your own messages can be edited.");
     if (m.fwdFromDate != null) throw new ApiError(403, "EDIT_NOT_ALLOWED", "Forwarded messages cannot be edited.");
     if (this.now() - m.createdAt > this.cfg.editLimitMs) {
       throw new ApiError(403, "EDIT_TIME_EXPIRED", "This message is too old to edit.");
     }
-    const t = this.validateText(text);
+    const t = this.validateText(text, this.messageChat(m, me));
     if (t === m.text) throw new ApiError(409, "TEXT_UNCHANGED", "Nothing changed.");
     const updated = this.write(() => {
       const row = this.db
@@ -773,7 +1218,7 @@ export class Relay {
         .where(eq(messages.id, m.id))
         .returning()
         .get();
-      for (const u of [row.senderId, row.recipientId]) {
+      for (const u of this.audience(row)) {
         if (this.isVisible(row, u)) this.emit(u, "message.edited", { message: this.wireMessage(row, u) });
       }
       this.emitReplyUpdated([row.id], null);
@@ -782,10 +1227,51 @@ export class Relay {
     return { message: this.wireMessage(updated, me), seq: this.currentSeq(me) };
   }
 
+  // ---------------------------------------------------------------- reactions
+
+  react(me: number, idRaw: unknown, emoji: unknown) {
+    if (!isInt(idRaw)) throw Errors.messageNotFound();
+    const m = this.getMessage(idRaw);
+    if (!m || !this.isVisible(m, me) || m.service) throw Errors.messageNotFound();
+    if (emoji !== null && !(typeof emoji === "string" && (REACTIONS as readonly string[]).includes(emoji))) {
+      throw Errors.validation("Pick one of the offered reactions.");
+    }
+    const current = this.db
+      .select()
+      .from(messageReactions)
+      .where(and(eq(messageReactions.messageId, m.id), eq(messageReactions.userId, me)))
+      .get();
+    if ((current?.emoji ?? null) !== emoji) {
+      this.write(() => {
+        if (emoji === null) {
+          this.db
+            .delete(messageReactions)
+            .where(and(eq(messageReactions.messageId, m.id), eq(messageReactions.userId, me)))
+            .run();
+        } else {
+          this.db
+            .insert(messageReactions)
+            .values({ messageId: m.id, userId: me, emoji, createdAt: this.now() })
+            .onConflictDoUpdate({ target: [messageReactions.messageId, messageReactions.userId], set: { emoji } })
+            .run();
+        }
+        for (const u of this.audience(m)) {
+          if (!this.isVisible(m, u)) continue;
+          this.emit(u, "message.reactions", {
+            peerId: this.msgPeer(m, u),
+            messageId: m.id,
+            reactions: this.reactionsFor(m.id, u),
+          });
+        }
+      });
+    }
+    return { reactions: this.reactionsFor(m.id, me), seq: this.currentSeq(me) };
+  }
+
   // ---------------------------------------------------------------- H12 delete
 
   deleteMessages(me: number, peerId: unknown, body: { ids?: unknown; forEveryone?: unknown }) {
-    const peer = this.requirePeer(me, peerId);
+    const chat = this.chat(me, peerId);
     if (!Array.isArray(body.ids) || !body.ids.every(isInt)) throw Errors.validation("ids must be a list of integers.");
     if (body.ids.length > MAX_IDS) throw Errors.tooManyIds();
     const forEveryone = body.forEveryone === true;
@@ -794,7 +1280,7 @@ export class Relay {
     const rows = this.db
       .select()
       .from(messages)
-      .where(and(inArray(messages.id, ids), this.inConv(me, peer.id), this.visibleTo(me)))
+      .where(and(inArray(messages.id, ids), this.chatCond(chat, me), this.visibleTo(me)))
       .orderBy(asc(messages.id))
       .all();
     if (rows.length === 0) return { deletedIds: [], seq: this.currentSeq(me) };
@@ -802,26 +1288,30 @@ export class Relay {
       const now = this.now();
       for (const r of rows) {
         if (this.cfg.revokeLimitMs != null && now - r.createdAt > this.cfg.revokeLimitMs) {
-          throw new ApiError(403, "REVOKE_FORBIDDEN", "This message is too old to delete for both of you.");
+          throw new ApiError(403, "REVOKE_FORBIDDEN", "This message is too old to delete for everyone.");
         }
-        if (!this.cfg.revokePeerMessages && r.senderId !== me) {
-          throw new ApiError(403, "REVOKE_FORBIDDEN", "Only your own messages can be deleted for both of you.");
+        if (r.senderId === me) continue;
+        if (chat.kind === "group" ? chat.group.ownerId !== me : !this.cfg.revokePeerMessages) {
+          throw new ApiError(403, "REVOKE_FORBIDDEN", "Only your own messages can be deleted for everyone.");
         }
       }
     }
     const deletedIds = rows.map((r) => r.id);
     this.write(() => {
       if (forEveryone) {
-        const peerVisible = rows.filter((r) => this.isVisible(r, peer.id)).map((r) => r.id);
+        const others = this.membersOf(chat, me).filter((u) => u !== me);
+        const visibleFor = new Map(others.map((u) => [u, rows.filter((r) => this.isVisible(r, u)).map((r) => r.id)]));
         this.db.update(messages).set({ deletedForEveryoneAt: this.now() }).where(inArray(messages.id, deletedIds)).run();
-        this.emit(me, "messages.deleted", { peerId: peer.id, ids: deletedIds });
-        if (peerVisible.length > 0) this.emit(peer.id, "messages.deleted", { peerId: me, ids: peerVisible });
+        this.emit(me, "messages.deleted", { peerId: chat.peerId, ids: deletedIds });
+        for (const [u, seen] of visibleFor) {
+          if (seen.length > 0) this.emit(u, "messages.deleted", { peerId: this.viewerPeer(chat, me, u), ids: seen });
+        }
         this.emitReplyUpdated(deletedIds, null);
       } else {
         for (const id of deletedIds) {
           this.db.insert(messageHidden).values({ userId: me, messageId: id }).onConflictDoNothing().run();
         }
-        this.emit(me, "messages.deleted", { peerId: peer.id, ids: deletedIds });
+        this.emit(me, "messages.deleted", { peerId: chat.peerId, ids: deletedIds });
         this.emitReplyUpdated(deletedIds, [me]);
       }
     });
@@ -835,8 +1325,11 @@ export class Relay {
     targetPeerId: unknown,
     body: { fromPeerId?: unknown; messageIds?: unknown; clientTokens?: unknown; hideSender?: unknown },
   ) {
-    const target = this.requirePeer(me, targetPeerId);
-    const from = this.requirePeer(me, body.fromPeerId);
+    const target = this.chat(me, targetPeerId);
+    const from = this.chat(me, body.fromPeerId);
+    if (target.kind === "secret" || from.kind === "secret") {
+      throw new ApiError(403, "FORWARD_NOT_ALLOWED", "Secret chat messages can't be forwarded.");
+    }
     const ids = body.messageIds;
     const tokens = body.clientTokens;
     if (!Array.isArray(ids) || !ids.every(isInt) || ids.length === 0) throw Errors.validation("messageIds required.");
@@ -857,13 +1350,13 @@ export class Relay {
         .all();
       return { messages: stored.map((r) => this.wireMessage(r, me)), seq: this.currentSeq(me), duplicate: true };
     }
+    this.assertCanMessage(me, target);
 
     const pairs = (ids as number[]).map((id, i) => ({ id, token: (tokens as string[])[i] }));
     const sources = new Map<number, MessageRow>();
     for (const p of pairs) {
       const m = this.getMessage(p.id);
-      const [lo, hi] = conv(me, from.id);
-      if (!m || m.convLow !== lo || m.convHigh !== hi || !this.isVisible(m, me)) throw Errors.messageNotFound();
+      if (!m || m.service || !this.inChat(m, from, me) || !this.isVisible(m, me)) throw Errors.messageNotFound();
       sources.set(p.id, m);
     }
     pairs.sort((a, b) => a.id - b.id);
@@ -872,7 +1365,7 @@ export class Relay {
     const created = this.write(() => {
       const mapped = new Map<number, number>();
       const out: MessageRow[] = [];
-      const [lo, hi] = conv(me, target.id);
+      const address = this.address(target, me);
       for (const p of pairs) {
         const src = sources.get(p.id)!;
         let fwd: { fwdFromUserId: number | null; fwdFromName: string | null; fwdFromDate: number | null } = {
@@ -893,10 +1386,8 @@ export class Relay {
         }
         const replyToId = src.replyToId != null ? (mapped.get(src.replyToId) ?? null) : null;
         const row = this.insertMessage({
-          convLow: lo,
-          convHigh: hi,
+          ...address,
           senderId: me,
-          recipientId: target.id,
           text: src.text,
           createdAt: this.now(),
           replyToId,
@@ -911,6 +1402,184 @@ export class Relay {
     });
     this.recordSends(me, created.length);
     return { messages: created.map((r) => this.wireMessage(r, me)), seq: this.currentSeq(me), duplicate: false };
+  }
+
+  // ---------------------------------------------------------------- groups
+
+  private validateTitle(title: unknown): string {
+    if (typeof title !== "string" || title.trim().length < 1 || title.trim().length > 64) {
+      throw Errors.validation("Group names are 1-64 characters.");
+    }
+    return title.trim();
+  }
+
+  /** Live, distinct users other than `me` from a request body list. */
+  private validateUserIds(me: number, raw: unknown): UserRow[] {
+    if (!Array.isArray(raw) || !raw.every(isInt)) throw Errors.validation("userIds must be a list of ids.");
+    const ids = [...new Set(raw as number[])].filter((id) => id !== me);
+    if (ids.length > MAX_GROUP_MEMBERS) throw Errors.validation(`Groups can have up to ${MAX_GROUP_MEMBERS} members.`);
+    const rows = ids.length ? this.db.select().from(users).where(inArray(users.id, ids)).all() : [];
+    if (rows.length !== ids.length || rows.some((u) => u.deletedAt != null)) throw Errors.peerInvalid();
+    return ids.map((id) => rows.find((u) => u.id === id)!);
+  }
+
+  private groupChat(me: number, peerId: unknown): Extract<Chat, { kind: "group" }> {
+    const chat = this.chat(me, peerId);
+    if (chat.kind !== "group") throw Errors.peerInvalid();
+    return chat;
+  }
+
+  private emitGroupUpdated(chat: Extract<Chat, { kind: "group" }>): void {
+    const group = this.db.select().from(groups).where(eq(groups.id, chat.group.id)).get()!;
+    const info = this.groupInfo(group);
+    for (const u of this.memberIds(group.id)) this.emit(u, "group.updated", { peerId: chat.peerId, group: info });
+  }
+
+  createGroup(me: number, body: { title?: unknown; userIds?: unknown }) {
+    const title = this.validateTitle(body.title);
+    const others = this.validateUserIds(me, body.userIds);
+    if (others.length === 0) throw Errors.validation("Add at least one person.");
+    if (others.length + 1 > MAX_GROUP_MEMBERS) throw Errors.validation(`Groups can have up to ${MAX_GROUP_MEMBERS} members.`);
+    const peerId = this.write(() => {
+      const now = this.now();
+      const group = this.db.insert(groups).values({ title, ownerId: me, createdAt: now }).returning().get();
+      for (const u of [me, ...others.map((o) => o.id)]) {
+        this.db.insert(groupMembers).values({ groupId: group.id, userId: u, joinedAt: now }).run();
+      }
+      const chat: Chat = { kind: "group", peerId: groupPeer(group.id), group };
+      this.insertService(chat, me, { type: "groupCreated", title });
+      return chat.peerId;
+    });
+    return { peerId, seq: this.currentSeq(me) };
+  }
+
+  getGroup(me: number, peerId: unknown) {
+    return { group: this.groupInfo(this.groupChat(me, peerId).group) };
+  }
+
+  renameGroup(me: number, peerId: unknown, body: { title?: unknown }) {
+    const chat = this.groupChat(me, peerId);
+    const title = this.validateTitle(body.title);
+    if (title !== chat.group.title) {
+      this.write(() => {
+        this.db.update(groups).set({ title }).where(eq(groups.id, chat.group.id)).run();
+        this.insertService(chat, me, { type: "groupRenamed", title });
+        this.emitGroupUpdated(chat);
+      });
+    }
+    return { seq: this.currentSeq(me) };
+  }
+
+  addMembers(me: number, peerId: unknown, body: { userIds?: unknown }) {
+    const chat = this.groupChat(me, peerId);
+    const current = new Set(this.memberIds(chat.group.id));
+    const added = this.validateUserIds(me, body.userIds).filter((u) => !current.has(u.id));
+    if (current.size + added.length > MAX_GROUP_MEMBERS) {
+      throw Errors.validation(`Groups can have up to ${MAX_GROUP_MEMBERS} members.`);
+    }
+    if (added.length > 0) {
+      this.write(() => {
+        for (const u of added) {
+          this.db.insert(groupMembers).values({ groupId: chat.group.id, userId: u.id, joinedAt: this.now() }).run();
+        }
+        this.insertService(chat, me, {
+          type: "membersAdded",
+          userIds: added.map((u) => u.id),
+          names: added.map((u) => u.displayName),
+        });
+        this.emitGroupUpdated(chat);
+      });
+    }
+    return { added: added.map((u) => u.id), seq: this.currentSeq(me) };
+  }
+
+  /** Inside a write: `me` leaves the group; ownership passes to the longest-standing member. */
+  private leaveGroupTx(me: number, chat: Extract<Chat, { kind: "group" }>): void {
+    this.db
+      .delete(groupMembers)
+      .where(and(eq(groupMembers.groupId, chat.group.id), eq(groupMembers.userId, me)))
+      .run();
+    this.db.delete(dialogs).where(and(eq(dialogs.ownerId, me), eq(dialogs.peerId, chat.peerId))).run();
+    this.emit(me, "dialog.removed", { peerId: chat.peerId });
+    const remaining = this.memberIds(chat.group.id);
+    if (remaining.length === 0) return;
+    if (chat.group.ownerId === me) this.db.update(groups).set({ ownerId: remaining[0] }).where(eq(groups.id, chat.group.id)).run();
+    this.insertService(chat, me, { type: "memberLeft" });
+    this.emitGroupUpdated(chat);
+  }
+
+  /** Leave (userId = me) or, for the owner, remove someone. */
+  removeMember(me: number, peerId: unknown, userIdRaw: unknown) {
+    const chat = this.groupChat(me, peerId);
+    if (userIdRaw === me) {
+      this.write(() => this.leaveGroupTx(me, chat));
+      return { seq: this.currentSeq(me) };
+    }
+    if (!isInt(userIdRaw) || !this.isMember(chat.group.id, userIdRaw)) throw Errors.peerInvalid();
+    if (chat.group.ownerId !== me) throw new ApiError(403, "NOT_GROUP_OWNER", "Only the group owner can remove people.");
+    const target = this.user(userIdRaw)!;
+    this.write(() => {
+      this.db
+        .delete(groupMembers)
+        .where(and(eq(groupMembers.groupId, chat.group.id), eq(groupMembers.userId, target.id)))
+        .run();
+      this.db.delete(dialogs).where(and(eq(dialogs.ownerId, target.id), eq(dialogs.peerId, chat.peerId))).run();
+      this.emit(target.id, "dialog.removed", { peerId: chat.peerId });
+      this.insertService(chat, me, { type: "memberRemoved", userId: target.id, name: target.displayName });
+      this.emitGroupUpdated(chat);
+    });
+    return { seq: this.currentSeq(me) };
+  }
+
+  // ---------------------------------------------------------------- secret chats
+
+  /** Registers this device's public key (base64 raw uncompressed P-256 point). */
+  registerKey(me: number, publicKey: unknown) {
+    if (typeof publicKey !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(publicKey)) {
+      throw Errors.validation("publicKey must be a raw P-256 public key.");
+    }
+    const raw = Buffer.from(publicKey, "base64");
+    if (raw.length !== 65 || raw[0] !== 4) throw Errors.validation("publicKey must be a raw P-256 public key.");
+    this.db.insert(userKeys).values({ userId: me, publicKey, createdAt: this.now() }).onConflictDoNothing().run();
+    return { ok: true };
+  }
+
+  createSecretChat(me: number, body: { userId?: unknown; publicKey?: unknown }) {
+    if (!isInt(body.userId) || body.userId === me) throw Errors.peerInvalid();
+    const other = this.user(body.userId);
+    if (!other) throw Errors.peerInvalid();
+    const otherChat: Chat = { kind: "user", peerId: other.id, user: other };
+    this.assertCanMessage(me, otherChat);
+    const mine =
+      typeof body.publicKey === "string"
+        ? this.db
+            .select()
+            .from(userKeys)
+            .where(and(eq(userKeys.userId, me), eq(userKeys.publicKey, body.publicKey)))
+            .get()
+        : undefined;
+    if (!mine) throw Errors.validation("Register this device's key first.");
+    const theirs = this.db.select().from(userKeys).where(eq(userKeys.userId, other.id)).orderBy(desc(userKeys.id)).limit(1).get();
+    if (!theirs) {
+      throw new ApiError(409, "NO_SECRET_KEY", `${other.displayName} needs to open Relay once before you can start a secret chat.`);
+    }
+    const peerId = this.write(() => {
+      const secret = this.db
+        .insert(secretChats)
+        .values({
+          initiatorId: me,
+          responderId: other.id,
+          initiatorKey: mine.publicKey,
+          responderKey: theirs.publicKey,
+          createdAt: this.now(),
+        })
+        .returning()
+        .get();
+      const chat: Chat = { kind: "secret", peerId: secretPeer(secret.id), secret, other };
+      this.insertService(chat, me, { type: "secretStarted" });
+      return chat.peerId;
+    });
+    return { peerId, seq: this.currentSeq(me) };
   }
 
   // ---------------------------------------------------------------- H14 sync

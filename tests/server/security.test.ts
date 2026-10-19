@@ -52,7 +52,7 @@ describe("G6: auth throttling", () => {
 
   it("registration is limited per IP", async () => {
     srv = await startServer({ registerMaxPerIp: 2, authWindowMs: 60_000 });
-    const reg = (n: string) => new TestUser(srv).call("POST", "/api/auth/register", { username: n, displayName: n, password: "secret123" });
+    const reg = (n: string) => new TestUser(srv).call("POST", "/api/auth/register", { username: n, email: `${n}@example.test`, displayName: n, password: "secret123" });
     expect((await reg("one_1")).status).toBe(201);
     expect((await reg("two_2")).status).toBe(201);
     const third = await reg("three_3");

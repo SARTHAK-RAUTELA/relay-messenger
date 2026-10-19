@@ -21,9 +21,17 @@ const msg = (id: number, over: Partial<Message> = {}): Message => ({
   editDate: null,
   replyTo: null,
   forwardedFrom: null,
+  reactions: [],
+  service: null,
   ...over,
 });
 const dialog = (over: Partial<Dialog> = {}): Dialog => ({
+  kind: "user",
+  group: null,
+  secret: null,
+  blocked: false,
+  peerDeleted: false,
+  presence: null,
   peer: { id: 2, username: "bob", displayName: "Bob" },
   topMessage: msg(1),
   unreadCount: 0,
@@ -40,6 +48,9 @@ const noop = () => {};
 const rowProps = { active: false, now: Date.now(), onOpen: noop, onMarkRead: noop, onToggleMark: noop, onTogglePin: noop };
 const bubbleProps = {
   canEdit: false,
+  senderName: null,
+  canForward: true,
+  onReact: noop,
   highlighted: false,
   selectionMode: false,
   selected: false,

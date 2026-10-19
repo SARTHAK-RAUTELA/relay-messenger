@@ -19,5 +19,6 @@ export const Errors = {
   tokenInvalid: () => new ApiError(400, "TOKEN_INVALID", "clientToken must be a UUID."),
   replyTargetInvalid: () => new ApiError(400, "REPLY_TARGET_INVALID", "The message you replied to is not available."),
   tooManyIds: () => new ApiError(400, "TOO_MANY_IDS", "Too many messages in one request."),
+  emailTaken: () => new ApiError(409, "EMAIL_TAKEN", "That email is already used by another account."),
   rateLimited: (ms: number) => new ApiError(429, "RATE_LIMITED", "Slow down a little.", ms),
 };

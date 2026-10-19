@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { Messenger, type ClientConfig, type SocketLike } from "../../src/client/messenger";
 import type { TestServer } from "./server";
+import type { SecretKeyStore } from "../../src/client/secret";
 
 export type Verdict = "pass" | "network" | number;
 export type Interceptor = (method: string, path: string, body: any) => Verdict | string | Promise<Verdict | string>;
@@ -21,6 +22,7 @@ export class TestClient {
   constructor(
     public srv: TestServer,
     config: Partial<ClientConfig> = {},
+    opts: { secretKeys?: SecretKeyStore } = {},
   ) {
     const fetchImpl = async (url: string, init?: RequestInit) => {
       const path = url.replace(srv.base, "");
@@ -71,6 +73,7 @@ export class TestClient {
         return wrapper;
       },
       storage: null,
+      secretKeys: opts.secretKeys ?? null,
       config: { gapWaitMs: 80, sendRetryDelaysMs: [30, 30, 30], draftSaveDelayMs: 50, reconnectDelaysMs: [30], ...config },
     });
   }

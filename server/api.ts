@@ -127,6 +127,49 @@ export function createApiHandler(relay: Relay, hub: Hub) {
   add("POST", "/api/dialogs/:peerId/forward", true, ({ userId, params, body }) =>
     ok(relay.forwardMessages(userId, pathInt(params[0]), body)),
   );
+  // ---- reactions
+  add("PUT", "/api/messages/:id/reaction", true, ({ userId, params, body }) =>
+    ok(relay.react(userId, pathInt(params[0]), body.emoji ?? null)),
+  );
+
+  // ---- profile & account
+  add("PATCH", "/api/me", true, ({ userId, body }) => ok(relay.updateProfile(userId, body)));
+  add("PUT", "/api/me/email", true, ({ userId, body }) => ok(relay.updateEmail(userId, body)));
+  add("POST", "/api/me/password", true, async ({ userId, sessionId, body }) => {
+    const { endedSessions } = await relay.changePassword(userId, sessionId, body);
+    for (const sid of endedSessions) hub.closeSession(sid);
+    return ok({ ok: true });
+  });
+  add("POST", "/api/me/delete", true, async ({ userId, body }) => {
+    const { endedSessions } = await relay.deleteAccount(userId, body);
+    for (const sid of endedSessions) hub.closeSession(sid);
+    hub.broadcastPresence(userId);
+    return { status: 204, headers: { "set-cookie": clearSessionCookie() } };
+  });
+
+  // ---- blocking & presence
+  add("PUT", "/api/users/:id/block", true, ({ userId, params, body }) => {
+    const r = relay.setBlocked(userId, pathInt(params[0]), body.blocked);
+    hub.sendPresence(pathInt(params[0]), userId);
+    return ok(r);
+  });
+  add("GET", "/api/presence", true, ({ userId, query }) => ok(relay.presenceMany(userId, query.get("ids"))));
+
+  // ---- groups
+  add("POST", "/api/groups", true, ({ userId, body }) => ok(relay.createGroup(userId, body)));
+  add("GET", "/api/groups/:peerId", true, ({ userId, params }) => ok(relay.getGroup(userId, pathInt(params[0]))));
+  add("PATCH", "/api/groups/:peerId", true, ({ userId, params, body }) => ok(relay.renameGroup(userId, pathInt(params[0]), body)));
+  add("POST", "/api/groups/:peerId/members", true, ({ userId, params, body }) =>
+    ok(relay.addMembers(userId, pathInt(params[0]), body)),
+  );
+  add("POST", "/api/groups/:peerId/members/:userId/remove", true, ({ userId, params }) =>
+    ok(relay.removeMember(userId, pathInt(params[0]), pathInt(params[1]))),
+  );
+
+  // ---- secret chats
+  add("PUT", "/api/keys", true, ({ userId, body }) => ok(relay.registerKey(userId, body.publicKey)));
+  add("POST", "/api/secret-chats", true, ({ userId, body }) => ok(relay.createSecretChat(userId, body)));
+
   // ---- H14
   add("GET", "/api/sync", true, ({ userId, query }) => {
     const r = relay.sync(userId, int(query.get("since")), int(query.get("limit")));

@@ -7,11 +7,15 @@ import {
   dividerBeforeId,
   formatCount,
   goToBottomTarget,
+  messagePreview,
+  presenceLabel,
+  serviceText,
   openMode,
   sortRows,
   type PendingMessage,
 } from "../../src/client/derive";
 import type { Dialog, Message } from "../../src/shared/types";
+import { SECRET_BASE, groupIdOf, groupPeer, peerKind, secretIdOf, secretPeer } from "../../src/shared/peer";
 
 const msg = (id: number, over: Partial<Message> = {}): Message => ({
   id,
@@ -23,9 +27,17 @@ const msg = (id: number, over: Partial<Message> = {}): Message => ({
   editDate: null,
   replyTo: null,
   forwardedFrom: null,
+  reactions: [],
+  service: null,
   ...over,
 });
 const dialog = (peer: number, over: Partial<Dialog> = {}): Dialog => ({
+  kind: "user",
+  group: null,
+  secret: null,
+  blocked: false,
+  peerDeleted: false,
+  presence: null,
   peer: { id: peer, username: "u" + peer, displayName: "U" + peer },
   topMessage: null,
   unreadCount: 0,
@@ -125,5 +137,36 @@ describe("history decisions (BR-HIST)", () => {
     expect(goToBottomTarget({ jumpStack: [7], firstUnread: 5, lastVisibleId: 1 })).toEqual({ target: 7, popped: true });
     expect(goToBottomTarget({ jumpStack: [], firstUnread: 5, lastVisibleId: 3 })).toEqual({ target: 5, popped: false });
     expect(goToBottomTarget({ jumpStack: [], firstUnread: 5, lastVisibleId: 9 })).toEqual({ target: "end", popped: false });
+  });
+});
+
+describe("groups, presence and peer ids", () => {
+  it("service messages read as sentences; group rows show who wrote last", () => {
+    const created = msg(1, { service: { type: "groupCreated", title: "Trip" }, senderName: "Ben", text: "" });
+    expect(messagePreview(created)).toBe("Ben created the group “Trip”");
+    expect(messagePreview({ ...created, out: true })).toBe("You created the group “Trip”");
+    expect(serviceText({ type: "membersAdded", userIds: [3, 4], names: ["Cee", "Dee"] }, "Ada")).toBe("Ada added Cee, Dee");
+    const g = dialog(-5, { kind: "group", topMessage: msg(2, { peerId: -5, senderName: "Ben", text: "hi" }) });
+    expect(deriveRow(g, null).subtitle).toEqual({ kind: "message", text: "hi", forwarded: false, sender: "Ben" });
+    expect(deriveRow({ ...g, topMessage: created }, null).status).toBeNull();
+  });
+
+  it("presence labels", () => {
+    const now = new Date(2026, 9, 19, 15, 0).getTime();
+    expect(presenceLabel(null, now)).toBe("");
+    expect(presenceLabel({ online: true, lastSeen: null }, now)).toBe("online");
+    expect(presenceLabel({ online: false, lastSeen: null }, now)).toBe("last seen a while ago");
+    expect(presenceLabel({ online: false, lastSeen: now - 20_000 }, now)).toBe("last seen just now");
+    expect(presenceLabel({ online: false, lastSeen: now - 3600_000 }, now)).toMatch(/^last seen at /);
+    expect(presenceLabel({ online: false, lastSeen: now - 5 * 86400_000 }, now)).toMatch(/^last seen \w/);
+  });
+
+  it("peer ids encode users, groups and secret chats", () => {
+    expect(peerKind(12)).toBe("user");
+    expect(peerKind(groupPeer(12))).toBe("group");
+    expect(groupIdOf(groupPeer(12))).toBe(12);
+    expect(peerKind(secretPeer(1))).toBe("secret");
+    expect(secretIdOf(secretPeer(42))).toBe(42);
+    expect(peerKind(groupPeer(SECRET_BASE - 1))).toBe("group");
   });
 });

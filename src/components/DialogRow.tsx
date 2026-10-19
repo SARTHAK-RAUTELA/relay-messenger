@@ -45,12 +45,20 @@ export function DialogRow({ row, active, now, onOpen, onMarkRead, onToggleMark, 
         onDropOn?.();
       }}
     >
-      <div className="avatar" aria-hidden="true">
-        {initials(row.name)}
+      <div className={`avatar ${row.kind}`} aria-hidden="true">
+        {row.kind === "group" ? "👥" : initials(row.name)}
+        {row.online && <span className="online-dot" data-testid="online-dot" />}
       </div>
       <div className="row-main">
         <div className="row-top">
-          <span className="row-name">{row.name}</span>
+          <span className={`row-name${row.kind === "secret" ? " secret-name" : ""}`}>
+            {row.kind === "secret" && (
+              <span className="kind-icon" aria-label={copy.secretBadge}>
+                🔒
+              </span>
+            )}
+            {row.name}
+          </span>
           <span className="row-meta">
             {row.status && <StatusIcon status={row.status} />}
             {row.time != null && <time data-testid="row-time">{formatListTime(row.time, now)}</time>}
@@ -64,8 +72,10 @@ export function DialogRow({ row, active, now, onOpen, onMarkRead, onToggleMark, 
                 {sub.text}
               </>
             )}
+            {sub.kind === "typing" && <span className="typing-text">{sub.text}</span>}
             {sub.kind === "message" && (
               <>
+                {sub.sender && <span className="sender-prefix">{sub.sender}:</span>}
                 {sub.forwarded && (
                   <span className="fwd-marker" data-testid="fwd-marker" aria-label="forwarded">
                     {copy.forwardMarker}

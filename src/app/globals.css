@@ -116,6 +116,8 @@ input, textarea { font: inherit; }
 .bubble-row:hover .bubble-actions, .bubble-actions:focus-within { opacity: 1; }
 .bubble-actions > button { background: #fff; border: 1px solid var(--line); border-radius: 50%; width: 24px; height: 24px; padding: 0; color: var(--ink-soft); }
 .bubble .menu { top: 26px; }
+/* Incoming bubbles sit on the left edge: open their menu rightwards so it stays inside the chat. */
+.in .bubble .menu { left: 0; right: auto; }
 .failed-actions { display: flex; gap: 6px; margin-top: 4px; justify-content: flex-end; }
 .failed-actions button { font-size: 12px; border-radius: 8px; border: 1px solid var(--line); background: #fff; padding: 2px 8px; }
 
@@ -157,3 +159,46 @@ input, textarea { font: inherit; }
 .modal input[type="text"], .modal input[type="search"] { padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; width: 100%; }
 .toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: grid; gap: 6px; z-index: 60; }
 .toast { background: var(--ink); color: #fff; padding: 8px 14px; border-radius: 10px; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,.2); }
+
+/* ---------- presence, typing, chat kinds */
+.avatar { position: relative; }
+.avatar.group { background: var(--saffron); color: var(--pine); }
+.avatar.secret { background: var(--pine); color: #9fe0b9; }
+.online-dot { position: absolute; right: -2px; bottom: -2px; width: 12px; height: 12px; border-radius: 50%; background: #3fae6a; border: 2px solid var(--paper-2); }
+.kind-icon { margin-right: 4px; font-size: 12px; }
+.secret-name { color: #2f7a4f; }
+.typing-text { color: var(--pine-2); font-style: italic; }
+.sender-prefix { color: var(--pine-2); font-weight: 600; margin-right: 4px; }
+.sidebar-head .me { background: none; border: 0; color: #fff; text-decoration: underline dotted; padding: 0; font-size: 13px; }
+.sidebar-tools { display: flex; gap: 8px; padding: 0 12px 6px; }
+.sidebar-tools .ghost { padding: 5px 10px; font-size: 13px; }
+.conv-head .grow { flex: 1; min-width: 0; }
+.conv-head { position: relative; }
+.conv-head .menu { top: 52px; }
+.conv-banner { border-top: 1px solid var(--line); background: #fff; padding: 12px 16px; color: var(--ink-soft); display: flex; gap: 10px; align-items: center; justify-content: center; font-size: 14px; }
+
+/* ---------- service messages, sender names, reactions */
+.service-row { text-align: center; margin: 8px 0; }
+.service-row span { background: rgba(31,58,52,.08); color: var(--ink-soft); font-size: 12.5px; padding: 4px 12px; border-radius: 999px; display: inline-block; }
+.sender-name { font-size: 13px; font-weight: 700; color: var(--clay); margin-bottom: 2px; }
+.bubble.undecryptable .bubble-text { font-style: italic; color: var(--ink-soft); }
+.reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.reaction { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 0 7px; font-size: 13px; line-height: 22px; }
+.reaction.mine { background: #dceee2; border-color: #8cc4a0; }
+.react-bar { display: flex; gap: 2px; padding: 4px; border-bottom: 1px solid var(--paper-2); margin-bottom: 2px; }
+.react-bar button { width: auto; padding: 4px 5px; font-size: 18px; }
+
+/* ---------- dialogs */
+.modal section { display: grid; gap: 8px; }
+.modal section + section { border-top: 1px solid var(--paper-2); padding-top: 12px; }
+.modal h3 { margin: 0; font-size: 15px; }
+.modal input[type="password"] { padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; width: 100%; }
+.modal .hint { color: var(--ink-soft); font-size: 13px; margin: 0; }
+.modal .ok { color: #2f7a4f; font-size: 13px; }
+.member-list { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; }
+.member-list li { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+.member-list li .grow { flex: 1; }
+.member-list .tag { font-size: 11px; color: var(--ink-soft); border: 1px solid var(--line); border-radius: 6px; padding: 0 5px; }
+.fingerprint { font-family: ui-monospace, Consolas, monospace; font-size: 17px; letter-spacing: 1px; text-align: center; background: var(--paper); border-radius: 10px; padding: 12px; word-spacing: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { background: var(--paper-2); border-radius: 999px; padding: 2px 10px; font-size: 13px; border: 0; }

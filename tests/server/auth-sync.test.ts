@@ -55,9 +55,9 @@ describe("auth (BR-AUTH)", () => {
 
   it("register validates and rejects taken usernames (case-insensitive)", async () => {
     await new TestUser(srv).register("dave", "Dave");
-    const dup = await new TestUser(srv).call("POST", "/api/auth/register", { username: "DAVE", displayName: "x", password: "secret123" });
+    const dup = await new TestUser(srv).call("POST", "/api/auth/register", { username: "DAVE", email: "dave2@example.test", displayName: "x", password: "secret123" });
     expect(dup.body.error.code).toBe("USERNAME_TAKEN");
-    const bad = await new TestUser(srv).call("POST", "/api/auth/register", { username: "a b", displayName: "x", password: "secret123" });
+    const bad = await new TestUser(srv).call("POST", "/api/auth/register", { username: "a b", email: "ab@example.test", displayName: "x", password: "secret123" });
     expect(bad.status).toBe(400);
     expect(bad.body.error.code).toBe("VALIDATION_FAILED");
   });
@@ -67,7 +67,7 @@ describe("auth (BR-AUTH)", () => {
     const r = await fetch(srv.base + "/api/auth/register", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: "erin", displayName: "Erin", password: "secret123" }),
+      body: JSON.stringify({ username: "erin", email: "erin@example.test", displayName: "Erin", password: "secret123" }),
     });
     const sc = r.headers.get("set-cookie")!;
     expect(sc).toMatch(/HttpOnly/);

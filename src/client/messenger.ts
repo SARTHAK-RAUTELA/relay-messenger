@@ -1,9 +1,21 @@
 // Relay client core: cache, sync engine, send pipeline, read tracking, conversation state.
 // Framework-free; the React UI subscribes to it. Rules reference spec section 6.
 
-import type { Dialog, Draft, Message, ServerFrame, SyncEvent, UserSummary } from "../shared/types";
+import type {
+  ClientFrame,
+  Dialog,
+  Draft,
+  Message,
+  Presence,
+  Reaction,
+  SecretInfo,
+  ServerFrame,
+  SyncEvent,
+  UserSummary,
+} from "../shared/types";
 import { MAX_TEXT_LEN, isBlank, previewText, splitText, uuidV4 } from "../shared/text";
 import { activityDate } from "../shared/dialogOrder";
+import { peerKind, secretIdOf } from "../shared/peer";
 import { ApiClient, ApiFailure, type FetchLike } from "./api";
 import {
   buildTimeline,
@@ -12,6 +24,7 @@ import {
   firstPageSize,
   firstUnreadId,
   goToBottomTarget,
+  messagePreview,
   openMode,
   sortRows,
   type ClientDialog,
@@ -20,6 +33,16 @@ import {
   type TimelineItem,
 } from "./derive";
 import { copy } from "./copy";
+import {
+  decryptText,
+  deriveChatKey,
+  encryptText,
+  exportPublicKey,
+  generateDeviceKey,
+  keyFingerprint,
+  secretSupported,
+  type SecretKeyStore,
+} from "./secret";
 
 export interface SocketLike {
   readyState: number;
@@ -67,8 +90,17 @@ export interface ClientDeps {
   fetch: FetchLike;
   openSocket: (url: string) => SocketLike;
   storage?: StorageLike | null;
+  /** Device key storage for secret chats; without it secret chats are unavailable. */
+  secretKeys?: SecretKeyStore | null;
   config?: Partial<ClientConfig>;
 }
+
+/** How long a typing notice stays visible without a refresh. */
+const TYPING_TTL_MS = 6000;
+/** Minimum gap between typing notices we send for one chat. */
+const TYPING_SEND_GAP_MS = 3000;
+
+export type SecretStatus = "ready" | "otherDevice" | "unsupported";
 
 export interface ConvState {
   peerId: number;
@@ -119,6 +151,8 @@ export class Messenger {
   syncing = false;
   resetting = false;
   me: UserSummary | null = null;
+  /** My account email (private; null for accounts made before emails existed). */
+  myEmail: string | null = null;
   dialogs = new Map<number, ClientDialog>();
   dialogsCursor: string | null = null;
   convs = new Map<number, ConvState>();
@@ -133,6 +167,12 @@ export class Messenger {
   focusGateOpen = true;
   /** OD-15: scroll memory per conversation for this browser session. */
   scrollMemory = new Map<number, { anchorId: number; offset: number }>();
+  /** Presence by user id (from dialogs, /api/presence and presence frames). */
+  presence = new Map<number, Presence>();
+  /** peerId -> userId -> expiry time of their typing notice. */
+  typing = new Map<number, Map<number, number>>();
+  /** This device's secret-chat public key (base64), once loaded. */
+  devicePublicKey: string | null = null;
 
   readonly cfg: ClientConfig;
   readonly api: ApiClient;
@@ -163,6 +203,12 @@ export class Messenger {
   private scrollNonce = 0;
   private stopped = false;
   private fetchingDialogs = new Map<number, Promise<ClientDialog>>();
+  private deviceKeys: CryptoKeyPair | null = null;
+  private keysReady: Promise<void> = Promise.resolve();
+  private chatKeys = new Map<number, Promise<CryptoKey | null>>();
+  private typingSentAt = new Map<number, number>();
+  private typingTimer: ReturnType<typeof setTimeout> | null = null;
+  private leaving = new Set<number>();
 
   constructor(private deps: ClientDeps) {
     this.cfg = { ...defaultClientConfig, ...(deps.config ?? {}) };
@@ -230,9 +276,14 @@ export class Messenger {
 
   async start(): Promise<void> {
     try {
-      const me = await this.api.call<{ user: UserSummary; seq: number; serverTime: number }>("GET", "/api/me");
+      const me = await this.call<{ user: UserSummary; email: string | null; seq: number; serverTime: number }>(
+        "GET",
+        "/api/me",
+      );
       this.me = me.user;
+      this.myEmail = me.email;
       this.serverOffset = me.serverTime - Date.now();
+      this.keysReady = this.loadDeviceKeys(me.user.id);
       await this.init();
     } catch (e) {
       if (e instanceof ApiFailure && e.status === 401) {
@@ -244,30 +295,245 @@ export class Messenger {
     }
   }
 
+  /** `username` may also be the account's email address. */
   async login(username: string, password: string): Promise<void> {
-    const r = await this.api.call<{ user: UserSummary }>("POST", "/api/auth/login", { username, password });
+    const r = await this.call<{ user: UserSummary }>("POST", "/api/auth/login", { username, password });
     this.me = r.user;
     await this.start();
   }
 
-  async register(username: string, displayName: string, password: string): Promise<void> {
-    const r = await this.api.call<{ user: UserSummary }>("POST", "/api/auth/register", { username, displayName, password });
+  async register(username: string, email: string, displayName: string, password: string): Promise<void> {
+    const r = await this.call<{ user: UserSummary }>("POST", "/api/auth/register", { username, email, displayName, password });
     this.me = r.user;
     await this.start();
   }
 
   async logout(): Promise<void> {
     try {
-      await this.api.call("POST", "/api/auth/logout");
+      await this.call("POST", "/api/auth/logout");
     } catch {
       /* ignore */
     }
+    this.signedOut();
+  }
+
+  private signedOut(): void {
     this.stop();
     this.clearAll(true);
     this.me = null;
+    this.myEmail = null;
+    this.deviceKeys = null;
+    this.devicePublicKey = null;
+    this.chatKeys.clear();
+    this.presence.clear();
     this.phase = "signedOut";
     this.stopped = false;
     this.changed();
+  }
+
+  /** Loads (or creates) this device's secret-chat key pair and registers its public half. */
+  private async loadDeviceKeys(userId: number): Promise<void> {
+    const store = this.deps.secretKeys;
+    if (!store || !secretSupported()) return;
+    try {
+      let pair = await store.load(userId);
+      if (!pair) {
+        pair = await generateDeviceKey();
+        await store.save(userId, pair);
+      }
+      this.deviceKeys = pair;
+      this.devicePublicKey = await exportPublicKey(pair.publicKey);
+      await this.api.call("PUT", "/api/keys", { publicKey: this.devicePublicKey });
+    } catch {
+      /* secret chats stay unavailable on this device */
+    }
+  }
+
+  /** API call whose result has secret-chat messages decrypted. */
+  private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    return this.decode(await this.api.call<T>(method, path, body));
+  }
+
+  // ================================================================= secret chats (decode/encode)
+
+  /** Decrypts secret-chat messages in an API result and records presence from dialogs. */
+  private async decode<T>(r: T): Promise<T> {
+    const o = r as { message?: Message; messages?: Message[]; dialog?: Dialog; dialogs?: Dialog[] } | null;
+    if (!o || typeof o !== "object") return r;
+    if (o.dialog) o.dialog = await this.decodeDialog(o.dialog);
+    if (Array.isArray(o.dialogs)) o.dialogs = await Promise.all(o.dialogs.map((d) => this.decodeDialog(d)));
+    if (o.message) o.message = await this.decodeMessage(o.message);
+    if (Array.isArray(o.messages)) o.messages = await Promise.all(o.messages.map((m) => this.decodeMessage(m)));
+    return r;
+  }
+
+  private async decodeDialog(d: Dialog): Promise<Dialog> {
+    this.notePresence(d);
+    if (d.kind !== "secret" || !d.topMessage) return d;
+    return { ...d, topMessage: await this.decodeMessage(d.topMessage, d.secret) };
+  }
+
+  private async decodeMessage(m: Message, info?: SecretInfo | null): Promise<Message> {
+    if (peerKind(m.peerId) !== "secret" || m.service) return m;
+    const key = await this.secretKey(m.peerId, info);
+    const sid = secretIdOf(m.peerId);
+    const open = async (t: string): Promise<string | null> => {
+      if (!key) return null;
+      try {
+        return await decryptText(key, t, sid);
+      } catch {
+        return null;
+      }
+    };
+    const text = await open(m.text);
+    let replyTo = m.replyTo;
+    if (replyTo && !replyTo.deleted) {
+      const s = await open(replyTo.snippet);
+      replyTo = { ...replyTo, snippet: s == null ? copy.cantDecrypt : previewText(s) };
+    }
+    return { ...m, text: text ?? copy.cantDecrypt, undecryptable: text == null, replyTo };
+  }
+
+  /** The chat key for a secret chat, or null when this device does not hold a matching key. */
+  private secretKey(peerId: number, info?: SecretInfo | null): Promise<CryptoKey | null> {
+    const cached = this.chatKeys.get(peerId);
+    if (cached) return cached;
+    const p = (async () => {
+      await this.keysReady;
+      const s =
+        info ??
+        this.dialogs.get(peerId)?.secret ??
+        (await this.api.call<{ dialog: Dialog }>("GET", `/api/dialogs/${peerId}`)).dialog.secret;
+      if (!s || !this.deviceKeys || !this.me) return null;
+      const iAmInitiator = s.initiatorId === this.me.id;
+      if ((iAmInitiator ? s.initiatorKey : s.responderKey) !== this.devicePublicKey) return null;
+      return deriveChatKey(this.deviceKeys.privateKey, iAmInitiator ? s.responderKey : s.initiatorKey, s.id);
+    })().catch(() => null);
+    this.chatKeys.set(peerId, p);
+    // A failed lookup (network) should not stick.
+    void p.then((k) => {
+      if (!k && !this.dialogs.get(peerId)?.secret) this.chatKeys.delete(peerId);
+    });
+    return p;
+  }
+
+  secretStatus(peerId: number): SecretStatus {
+    const s = this.dialogs.get(peerId)?.secret;
+    if (!this.devicePublicKey || !this.me) return "unsupported";
+    if (!s) return "ready";
+    const mine = s.initiatorId === this.me.id ? s.initiatorKey : s.responderKey;
+    return mine === this.devicePublicKey ? "ready" : "otherDevice";
+  }
+
+  async secretFingerprint(peerId: number): Promise<string | null> {
+    const s = this.dialogs.get(peerId)?.secret;
+    if (!s || !secretSupported()) return null;
+    return keyFingerprint(s.initiatorKey, s.responderKey);
+  }
+
+  /** Text as it goes on the wire: encrypted for secret chats. */
+  private async outgoingText(peerId: number, text: string): Promise<string> {
+    if (peerKind(peerId) !== "secret") return text;
+    const key = await this.secretKey(peerId);
+    if (!key) throw new ApiFailure(0, "SECRET_UNAVAILABLE", copy.secretOtherDevice, false);
+    return encryptText(key, text, secretIdOf(peerId));
+  }
+
+  // ================================================================= presence & typing
+
+  /** The user behind a one-to-one or secret chat. */
+  peerUserId(peerId: number): number | null {
+    const kind = peerKind(peerId);
+    if (kind === "user") return peerId;
+    if (kind === "secret") return this.dialogs.get(peerId)?.secret?.userId ?? null;
+    return null;
+  }
+
+  private notePresence(d: Dialog): void {
+    const userId = d.kind === "user" ? d.peer.id : d.kind === "secret" ? d.secret?.userId : null;
+    if (userId != null && d.presence) this.presence.set(userId, d.presence);
+  }
+
+  presenceOf(peerId: number): Presence | null {
+    const userId = this.peerUserId(peerId);
+    return userId == null ? null : (this.presence.get(userId) ?? null);
+  }
+
+  /** After (re)connecting: presence frames missed while offline are not replayed. */
+  private async refreshPresence(): Promise<void> {
+    const ids = new Set<number>();
+    for (const d of this.dialogs.values()) {
+      const u = this.peerUserId(d.peer.id);
+      if (u != null) ids.add(u);
+    }
+    if (ids.size === 0) return;
+    try {
+      const r = await this.api.call<{ presence: Record<string, Presence> }>(
+        "GET",
+        `/api/presence?ids=${[...ids].slice(0, 200).join(",")}`,
+      );
+      for (const [id, p] of Object.entries(r.presence)) this.presence.set(Number(id), p);
+      this.changed();
+    } catch {
+      /* next reconnect tries again */
+    }
+  }
+
+  private sendFrame(frame: ClientFrame): void {
+    try {
+      this.socket?.send(JSON.stringify(frame));
+    } catch {
+      /* offline */
+    }
+  }
+
+  private maybeSendTyping(peerId: number): void {
+    const now = Date.now();
+    if (now - (this.typingSentAt.get(peerId) ?? 0) < TYPING_SEND_GAP_MS) return;
+    this.typingSentAt.set(peerId, now);
+    this.sendFrame({ kind: "typing", peerId });
+  }
+
+  private clearTyping(peerId: number | null, userId: number): void {
+    for (const [p, byUser] of this.typing) {
+      if (peerId != null && p !== peerId) continue;
+      byUser.delete(userId);
+      if (byUser.size === 0) this.typing.delete(p);
+    }
+  }
+
+  private scheduleTypingExpiry(): void {
+    if (this.typingTimer) return;
+    this.typingTimer = setTimeout(() => {
+      this.typingTimer = null;
+      const now = Date.now();
+      for (const [p, byUser] of this.typing) {
+        for (const [u, exp] of byUser) if (exp <= now) byUser.delete(u);
+        if (byUser.size === 0) this.typing.delete(p);
+      }
+      this.changed();
+      if (this.typing.size > 0) this.scheduleTypingExpiry();
+    }, 1000);
+  }
+
+  /** Names of the people typing in a chat right now. */
+  typingIn(peerId: number): string[] {
+    const byUser = this.typing.get(peerId);
+    if (!byUser) return [];
+    const now = Date.now();
+    return [...byUser]
+      .filter(([, exp]) => exp > now)
+      .map(([u]) => this.senderNameFor(peerId, u));
+  }
+
+  /** Display name of a message author in a chat. */
+  senderNameFor(peerId: number, senderId: number, msg?: Message): string {
+    if (senderId === this.me?.id) return this.me.displayName;
+    const d = this.dialogs.get(peerId);
+    if (d?.kind === "group") {
+      return d.group?.members.find((u) => u.id === senderId)?.displayName ?? msg?.senderName ?? "";
+    }
+    return d?.peer.displayName ?? msg?.senderName ?? "";
   }
 
   /** Tears down sockets and timers. */
@@ -278,6 +544,9 @@ export class Messenger {
     if (this.gapTimer) clearTimeout(this.gapTimer);
     for (const t of this.draftTimers.values()) clearTimeout(t);
     this.draftTimers.clear();
+    if (this.typingTimer) clearTimeout(this.typingTimer);
+    this.typingTimer = null;
+    this.typing.clear();
     this.reconnectTimer = null;
     this.pingTimer = null;
     this.gapTimer = null;
@@ -325,7 +594,7 @@ export class Messenger {
   }
 
   private async loadDialogsFresh(): Promise<void> {
-    const r = await this.api.call<{ dialogs: Dialog[]; nextCursor: string | null; seq: number }>("GET", "/api/dialogs?limit=50");
+    const r = await this.call<{ dialogs: Dialog[]; nextCursor: string | null; seq: number }>("GET", "/api/dialogs?limit=50");
     this.dialogs.clear();
     for (const d of r.dialogs) this.dialogs.set(d.peer.id, { ...d, listed: true });
     this.dialogsCursor = r.nextCursor;
@@ -335,7 +604,7 @@ export class Messenger {
 
   async loadMoreDialogs(): Promise<void> {
     if (!this.dialogsCursor) return;
-    const r = await this.api.call<{ dialogs: Dialog[]; nextCursor: string | null }>(
+    const r = await this.call<{ dialogs: Dialog[]; nextCursor: string | null }>(
       "GET",
       `/api/dialogs?limit=50&cursor=${encodeURIComponent(this.dialogsCursor)}`,
     );
@@ -392,12 +661,7 @@ export class Messenger {
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = null;
       if (ev.code === 4401) {
-        this.stop();
-        this.clearAll(true);
-        this.me = null;
-        this.phase = "signedOut";
-        this.stopped = false;
-        this.changed();
+        this.signedOut();
         return;
       }
       this.connection = "offline";
@@ -470,11 +734,27 @@ export class Messenger {
   /** Entry point for every server frame (exposed for tests). */
   handleFrame(frame: ServerFrame): void {
     if (frame.kind === "pong") return;
+    if (frame.kind === "presence") {
+      this.presence.set(frame.userId, { online: frame.online, lastSeen: frame.lastSeen });
+      if (!frame.online) this.clearTyping(null, frame.userId);
+      this.changed();
+      return;
+    }
+    if (frame.kind === "typing") {
+      if (frame.userId === this.me?.id) return;
+      const byUser = this.typing.get(frame.peerId) ?? new Map<number, number>();
+      byUser.set(frame.userId, Date.now() + TYPING_TTL_MS);
+      this.typing.set(frame.peerId, byUser);
+      this.scheduleTypingExpiry();
+      this.changed();
+      return;
+    }
     if (frame.kind === "hello") {
       this.serverOffset = frame.serverTime - Date.now();
       this.connection = "online";
       this.helloSeq = frame.seq;
       this.changed();
+      void this.track(this.refreshPresence());
       // BR-SYNC-3
       if (frame.seq > this.lastSeq) void this.catchUp();
       else if (frame.seq < this.lastSeq) void this.enqueue(() => this.reset(frame.seq));
@@ -548,7 +828,7 @@ export class Messenger {
         while (more) {
           let r: { events: SyncEvent[]; seq: number; more: boolean };
           try {
-            r = await this.api.call("GET", `/api/sync?since=${this.lastSeq}&limit=500`);
+            r = await this.call("GET", `/api/sync?since=${this.lastSeq}&limit=500`);
           } catch (e) {
             if (e instanceof ApiFailure && e.status === 410) {
               const seq = (e.body as { seq?: number } | undefined)?.seq ?? 0;
@@ -592,7 +872,7 @@ export class Messenger {
     try {
       this.clearAll(false);
       this.setLastSeq(seq);
-      const r = await this.api.call<{ dialogs: Dialog[]; nextCursor: string | null; seq: number }>(
+      const r = await this.call<{ dialogs: Dialog[]; nextCursor: string | null; seq: number }>(
         "GET",
         "/api/dialogs?limit=50",
       );
@@ -623,7 +903,7 @@ export class Messenger {
     if (inflight) return inflight;
     const p = (async () => {
       try {
-        const r = await this.api.call<{ dialog: Dialog }>("GET", `/api/dialogs/${peerId}`);
+        const r = await this.call<{ dialog: Dialog }>("GET", `/api/dialogs/${peerId}`);
         const prev = this.dialogs.get(peerId);
         const listed = (prev?.listed ?? false) || !!r.dialog.topMessage || !!r.dialog.draft || r.dialog.pinned;
         const d: ClientDialog = { ...r.dialog, listed };
@@ -634,6 +914,12 @@ export class Messenger {
         const prev = this.dialogs.get(peerId);
         if (prev) return prev;
         const stub: ClientDialog = {
+          kind: peerKind(peerId),
+          group: null,
+          secret: null,
+          blocked: false,
+          peerDeleted: false,
+          presence: null,
           peer: { id: peerId, username: "", displayName: "…" },
           topMessage: null,
           unreadCount: 0,
@@ -667,9 +953,54 @@ export class Messenger {
       const pend = this.pendingFor(d.peer.id);
       const latest = pend.length ? pend[pend.length - 1] : null;
       if (!d.listed && !latest && !d.draft && !d.pinned && !d.topMessage) continue;
-      rows.push(deriveRow(d, latest));
+      const row = deriveRow({ ...d, presence: this.presenceOf(d.peer.id) }, latest);
+      const typing = this.typingIn(d.peer.id);
+      if (typing.length > 0 && row.subtitle.kind !== "draft") {
+        row.subtitle = { kind: "typing", text: d.kind === "group" ? copy.typingNames(typing) : copy.typing };
+      }
+      rows.push(row);
     }
     return sortRows(rows);
+  }
+
+  /** Removes a chat this user can no longer see (left or removed from a group). */
+  private dropDialog(peerId: number): void {
+    this.dialogs.delete(peerId);
+    this.convs.delete(peerId);
+    for (const [token, p] of this.pending) if (p.peerId === peerId) this.pending.delete(token);
+    this.composer.delete(peerId);
+    this.replyTo.delete(peerId);
+    this.editing.delete(peerId);
+    this.selection.delete(peerId);
+    this.typing.delete(peerId);
+    if (this.openPeerId === peerId) this.openPeerId = null;
+    if (!this.leaving.delete(peerId)) this.notice(copy.removedFromChat);
+  }
+
+  /** Applies a profile change of another user everywhere their name is shown. */
+  private applyPeerUpdated(user: UserSummary, deleted: boolean): void {
+    for (const d of this.dialogs.values()) {
+      if (d.kind === "user" && d.peer.id === user.id) {
+        d.peer = user;
+        d.peerDeleted = deleted;
+      } else if (d.kind === "secret" && d.secret?.userId === user.id) {
+        d.peer = { ...user, id: d.peer.id };
+        d.peerDeleted = deleted;
+      } else if (d.kind === "group" && d.group) {
+        d.group = { ...d.group, members: d.group.members.map((m) => (m.id === user.id ? user : m)) };
+      }
+    }
+    for (const conv of this.convs.values()) {
+      if (peerKind(conv.peerId) === "user") continue;
+      conv.messages = conv.messages.map((m) => (m.senderId === user.id ? { ...m, senderName: user.displayName } : m));
+    }
+  }
+
+  private applyReactions(peerId: number, messageId: number, reactions: Reaction[]): void {
+    const conv = this.convs.get(peerId);
+    if (conv) conv.messages = conv.messages.map((m) => (m.id === messageId ? { ...m, reactions } : m));
+    const d = this.dialogs.get(peerId);
+    if (d?.topMessage?.id === messageId) d.topMessage = { ...d.topMessage, reactions };
   }
 
   // ================================================================= event application
@@ -678,11 +1009,38 @@ export class Messenger {
     switch (ev.type) {
       case "message.new": {
         await this.ensureDialog(ev.data.message.peerId);
-        this.applyNewMessage(ev.data.message);
+        const msg = await this.decodeMessage(ev.data.message);
+        this.clearTyping(msg.peerId, msg.senderId);
+        this.applyNewMessage(msg);
         break;
       }
       case "message.edited":
-        this.applyEdited(ev.data.message);
+        this.applyEdited(await this.decodeMessage(ev.data.message));
+        break;
+      case "message.reactions":
+        this.applyReactions(ev.data.peerId, ev.data.messageId, ev.data.reactions);
+        break;
+      case "dialog.removed":
+        this.dropDialog(ev.data.peerId);
+        break;
+      case "group.updated": {
+        const d = this.dialogs.get(ev.data.peerId);
+        if (d) {
+          d.group = ev.data.group;
+          d.peer = { ...d.peer, displayName: ev.data.group.title };
+        }
+        break;
+      }
+      case "peer.updated":
+        this.applyPeerUpdated(ev.data.user, ev.data.deleted);
+        break;
+      case "me.updated":
+        this.me = ev.data.user;
+        break;
+      case "user.blocked":
+        for (const d of this.dialogs.values()) {
+          if (this.peerUserId(d.peer.id) === ev.data.userId) d.blocked = ev.data.blocked;
+        }
         break;
       case "messages.deleted":
         await this.ensureDialog(ev.data.peerId);
@@ -787,8 +1145,7 @@ export class Messenger {
     const d = this.dialogs.get(peer);
     if (d?.topMessage?.id === msg.id) d.topMessage = msg; // no re-sort: date unchanged (BR-LIST-4)
     // BR-REPLY-7: update rendered reply headers.
-    const senderName =
-      msg.forwardedFrom?.name ?? (msg.out ? (this.me?.displayName ?? "") : (d?.peer.displayName ?? ""));
+    const senderName = msg.forwardedFrom?.name ?? this.senderNameFor(peer, msg.senderId, msg);
     this.patchReplyRefs(peer, (m) =>
       m.replyTo && m.replyTo.id === msg.id && !m.replyTo.deleted
         ? { ...m, replyTo: { ...m.replyTo, senderName, snippet: previewText(msg.text) } }
@@ -945,7 +1302,7 @@ export class Messenger {
         mode === "around"
           ? `/api/dialogs/${peerId}/messages?around=${cursor}&limit=40`
           : `/api/dialogs/${peerId}/messages?limit=${firstPageSize(viewportHeight)}`;
-      const r = await this.api.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>("GET", path);
+      const r = await this.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>("GET", path);
       conv.messages = [...r.messages].reverse();
       conv.hasOlder = r.hasOlder;
       conv.hasNewer = r.hasNewer;
@@ -997,7 +1354,7 @@ export class Messenger {
     conv.error = null;
     this.changed();
     try {
-      const r = await this.api.call<{ messages: Message[]; hasOlder: boolean }>(
+      const r = await this.call<{ messages: Message[]; hasOlder: boolean }>(
         "GET",
         `/api/dialogs/${peerId}/messages?before=${conv.messages[0].id}&limit=${this.cfg.olderPageSize}`,
       );
@@ -1020,7 +1377,7 @@ export class Messenger {
     conv.error = null;
     this.changed();
     try {
-      const r = await this.api.call<{ messages: Message[]; hasNewer: boolean }>(
+      const r = await this.call<{ messages: Message[]; hasNewer: boolean }>(
         "GET",
         `/api/dialogs/${peerId}/messages?after=${conv.messages[conv.messages.length - 1].id}&limit=${this.cfg.olderPageSize}`,
       );
@@ -1050,7 +1407,7 @@ export class Messenger {
   private async loadNewest(peerId: number): Promise<void> {
     const conv = this.convs.get(peerId) ?? this.newConv(peerId);
     this.convs.set(peerId, conv);
-    const r = await this.api.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>(
+    const r = await this.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>(
       "GET",
       `/api/dialogs/${peerId}/messages?limit=40`,
     );
@@ -1081,7 +1438,7 @@ export class Messenger {
       if (!conv.messages.some((m) => m.id === target)) {
         // The return point was unloaded by the jump: load the range around it first.
         try {
-          const r = await this.api.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>(
+          const r = await this.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>(
             "GET",
             `/api/dialogs/${peerId}/messages?around=${target}&limit=40`,
           );
@@ -1108,7 +1465,7 @@ export class Messenger {
     }
     if (!conv.messages.some((m) => m.id === targetId)) {
       try {
-        const r = await this.api.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>(
+        const r = await this.call<{ messages: Message[]; hasOlder: boolean; hasNewer: boolean }>(
           "GET",
           `/api/dialogs/${peerId}/messages?around=${targetId}&limit=40`,
         );
@@ -1144,6 +1501,8 @@ export class Messenger {
     this.composer.set(peerId, text);
     this.changed();
     if (this.editing.has(peerId)) return;
+    if (!isBlank(text)) this.maybeSendTyping(peerId);
+    if (peerKind(peerId) === "secret") return; // secret drafts never leave the device
     // OD-3: save the draft after a pause in typing.
     const t = this.draftTimers.get(peerId);
     if (t) clearTimeout(t);
@@ -1160,6 +1519,7 @@ export class Messenger {
     const t = this.draftTimers.get(peerId);
     if (t) clearTimeout(t);
     this.draftTimers.delete(peerId);
+    if (peerKind(peerId) === "secret") return;
     const ed = this.editing.get(peerId);
     const text = ed ? ed.savedComposer : (this.composer.get(peerId) ?? "");
     const d = this.dialogs.get(peerId);
@@ -1168,7 +1528,7 @@ export class Messenger {
     if (normalized === current) return;
     if (normalized.length > this.cfg.maxTextLen) return;
     try {
-      const r = await this.api.call<{ draft: Draft | null }>("PUT", `/api/dialogs/${peerId}/draft`, { text: normalized });
+      const r = await this.call<{ draft: Draft | null }>("PUT", `/api/dialogs/${peerId}/draft`, { text: normalized });
       const dd = this.dialogs.get(peerId);
       if (dd) {
         dd.draft = r.draft;
@@ -1196,7 +1556,7 @@ export class Messenger {
     const m = this.findMessage(peerId, id);
     if (!m) return { id, deleted: true };
     const d = this.dialogs.get(peerId);
-    const senderName = m.forwardedFrom?.name ?? (m.out ? (this.me?.displayName ?? "") : (d?.peer.displayName ?? ""));
+    const senderName = m.forwardedFrom?.name ?? this.senderNameFor(peerId, m.senderId, m);
     return { id, deleted: false, senderId: m.senderId, senderName, snippet: previewText(m.text) };
   }
 
@@ -1287,9 +1647,9 @@ export class Messenger {
       const p = this.pending.get(token);
       if (!p || p.state !== "sending") return;
       try {
-        const r = await this.api.call<{ message: Message; duplicate: boolean }>("POST", `/api/dialogs/${p.peerId}/messages`, {
+        const r = await this.call<{ message: Message; duplicate: boolean }>("POST", `/api/dialogs/${p.peerId}/messages`, {
           clientToken: p.token,
-          text: p.text,
+          text: await this.outgoingText(p.peerId, p.text),
           replyToId: p.replyToId ?? undefined,
           clearDraft: true,
         });
@@ -1423,7 +1783,7 @@ export class Messenger {
     let ok = false;
     for (let attempt = 0; attempt < 2 && !ok; attempt++) {
       try {
-        const r = await this.api.call<{ readInboxMaxId: number; unreadCount: number }>("POST", `/api/dialogs/${peerId}/read`, {
+        const r = await this.call<{ readInboxMaxId: number; unreadCount: number }>("POST", `/api/dialogs/${peerId}/read`, {
           maxId,
         });
         const cur = this.dialogs.get(peerId);
@@ -1467,7 +1827,7 @@ export class Messenger {
   }
 
   async setUnreadMark(peerId: number, marked: boolean): Promise<void> {
-    await this.api.call("PUT", `/api/dialogs/${peerId}/unread-mark`, { marked });
+    await this.call("PUT", `/api/dialogs/${peerId}/unread-mark`, { marked });
     const d = this.dialogs.get(peerId);
     if (d) d.unreadMark = marked;
     this.changed();
@@ -1475,7 +1835,7 @@ export class Messenger {
 
   async setPinned(peerId: number, pinned: boolean): Promise<void> {
     try {
-      const r = await this.api.call<{ pinnedOrder: number[] }>("PUT", `/api/dialogs/${peerId}/pin`, { pinned });
+      const r = await this.call<{ pinnedOrder: number[] }>("PUT", `/api/dialogs/${peerId}/pin`, { pinned });
       this.applyPinned(r.pinnedOrder);
       this.changed();
     } catch (e) {
@@ -1485,21 +1845,126 @@ export class Messenger {
   }
 
   async reorderPinned(order: number[]): Promise<void> {
-    const r = await this.api.call<{ pinnedOrder: number[] }>("PUT", "/api/dialogs/pinned-order", { order });
+    const r = await this.call<{ pinnedOrder: number[] }>("PUT", "/api/dialogs/pinned-order", { order });
     this.applyPinned(r.pinnedOrder);
     this.changed();
   }
 
+  // ================================================================= reactions
+
+  /** Sets (or with null clears) my reaction; tapping my current reaction again clears it. */
+  async react(peerId: number, messageId: number, emoji: string | null): Promise<void> {
+    try {
+      const r = await this.call<{ reactions: Reaction[] }>("PUT", `/api/messages/${messageId}/reaction`, { emoji });
+      this.applyReactions(peerId, messageId, r.reactions);
+      this.changed();
+    } catch (e) {
+      this.notice(e instanceof ApiFailure ? e.message : copy.loadFailed);
+    }
+  }
+
+  // ================================================================= profile & account
+
+  async updateProfile(displayName: string): Promise<void> {
+    const r = await this.call<{ user: UserSummary }>("PATCH", "/api/me", { displayName });
+    this.me = r.user;
+    this.changed();
+  }
+
+  async updateEmail(email: string): Promise<void> {
+    const r = await this.call<{ email: string }>("PUT", "/api/me/email", { email });
+    this.myEmail = r.email;
+    this.changed();
+  }
+
+  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+    await this.call("POST", "/api/me/password", { currentPassword, newPassword });
+  }
+
+  async deleteAccount(password: string): Promise<void> {
+    await this.call("POST", "/api/me/delete", { password });
+    this.signedOut();
+  }
+
+  // ================================================================= blocking
+
+  async setBlocked(peerId: number, blocked: boolean): Promise<void> {
+    const userId = this.peerUserId(peerId);
+    if (userId == null) return;
+    try {
+      await this.call("PUT", `/api/users/${userId}/block`, { blocked });
+      for (const d of this.dialogs.values()) if (this.peerUserId(d.peer.id) === userId) d.blocked = blocked;
+      this.changed();
+    } catch (e) {
+      this.notice(e instanceof ApiFailure ? e.message : copy.loadFailed);
+    }
+  }
+
+  // ================================================================= groups
+
+  /** Creates a group and opens it. Throws ApiFailure on validation errors. */
+  async createGroup(title: string, userIds: number[]): Promise<number> {
+    const r = await this.call<{ peerId: number }>("POST", "/api/groups", { title, userIds });
+    await this.fetchDialog(r.peerId);
+    await this.openConversation(r.peerId);
+    return r.peerId;
+  }
+
+  async renameGroup(peerId: number, title: string): Promise<void> {
+    await this.call("PATCH", `/api/groups/${peerId}`, { title });
+  }
+
+  async addMembers(peerId: number, userIds: number[]): Promise<void> {
+    await this.call("POST", `/api/groups/${peerId}/members`, { userIds });
+  }
+
+  async removeMember(peerId: number, userId: number): Promise<void> {
+    await this.call("POST", `/api/groups/${peerId}/members/${userId}/remove`, {});
+  }
+
+  async leaveGroup(peerId: number): Promise<void> {
+    if (!this.me) return;
+    this.leaving.add(peerId);
+    try {
+      await this.call("POST", `/api/groups/${peerId}/members/${this.me.id}/remove`, {});
+    } catch (e) {
+      this.leaving.delete(peerId);
+      throw e;
+    }
+  }
+
+  // ================================================================= secret chats
+
+  /** Starts a secret chat with a user from this device and opens it. */
+  async startSecretChat(userId: number): Promise<number | null> {
+    await this.keysReady;
+    if (!this.devicePublicKey) {
+      this.notice(copy.secretUnsupported);
+      return null;
+    }
+    try {
+      const r = await this.call<{ peerId: number }>("POST", "/api/secret-chats", { userId, publicKey: this.devicePublicKey });
+      await this.fetchDialog(r.peerId);
+      await this.openConversation(r.peerId);
+      return r.peerId;
+    } catch (e) {
+      this.notice(e instanceof ApiFailure ? e.message : copy.loadFailed);
+      return null;
+    }
+  }
+
   async searchUsers(q: string): Promise<UserSummary[]> {
     if (!q.trim()) return [];
-    const r = await this.api.call<{ users: UserSummary[] }>("GET", `/api/users/search?q=${encodeURIComponent(q)}`);
+    const r = await this.call<{ users: UserSummary[] }>("GET", `/api/users/search?q=${encodeURIComponent(q)}`);
     return r.users;
   }
 
   // ================================================================= edit (BR-EDIT)
 
   canEdit(m: Message): boolean {
-    return m.out && !m.forwardedFrom && m.date >= this.serverNow() - this.cfg.editLimitMs;
+    return (
+      m.out && !m.forwardedFrom && !m.service && !m.undecryptable && m.date >= this.serverNow() - this.cfg.editLimitMs
+    );
   }
 
   startEdit(peerId: number, messageId: number): void {
@@ -1540,7 +2005,9 @@ export class Messenger {
       }
     };
     try {
-      const r = await this.api.call<{ message: Message }>("PATCH", `/api/messages/${ed.messageId}`, { text });
+      const r = await this.call<{ message: Message }>("PATCH", `/api/messages/${ed.messageId}`, {
+        text: await this.outgoingText(peerId, text),
+      });
       this.applyEdited(r.message);
       finish();
     } catch (e) {
@@ -1564,7 +2031,7 @@ export class Messenger {
 
   /** Confirmed messages only; applied after the server confirms (BR-DEL-4). Throws on failure. */
   async deleteMessages(peerId: number, ids: number[], forEveryone: boolean): Promise<void> {
-    const r = await this.api.call<{ deletedIds: number[] }>("POST", `/api/dialogs/${peerId}/messages/delete`, {
+    const r = await this.call<{ deletedIds: number[] }>("POST", `/api/dialogs/${peerId}/messages/delete`, {
       ids,
       forEveryone,
     });
@@ -1644,7 +2111,6 @@ export class Messenger {
       .map((id) => fromConv?.messages.find((m) => m.id === id) ?? this.findMessage(opts.fromPeerId, id))
       .filter((m): m is Message => !!m)
       .sort((a, b) => a.id - b.id);
-    const fromDialog = this.dialogs.get(opts.fromPeerId);
     const succeeded: number[] = [];
     const failed: number[] = [];
     const jobs: Promise<void>[] = [];
@@ -1659,7 +2125,7 @@ export class Messenger {
           ? null
           : (src.forwardedFrom ?? {
               userId: src.senderId,
-              name: src.out ? (this.me?.displayName ?? "") : (fromDialog?.peer.displayName ?? ""),
+              name: this.senderNameFor(opts.fromPeerId, src.senderId, src),
               date: src.date,
             });
         const inBatch = src.replyTo ? copies.get(src.replyTo.id) : undefined;
@@ -1691,7 +2157,7 @@ export class Messenger {
     let attempts = 0;
     for (;;) {
       try {
-        const r = await this.api.call<{ messages: Message[] }>("POST", `/api/dialogs/${first.peerId}/forward`, {
+        const r = await this.call<{ messages: Message[] }>("POST", `/api/dialogs/${first.peerId}/forward`, {
           fromPeerId: first.batch!.fromPeerId,
           messageIds: items.map((x) => x.batch!.sourceId),
           clientTokens: items.map((x) => x.token),

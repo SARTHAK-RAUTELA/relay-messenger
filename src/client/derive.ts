@@ -1,9 +1,34 @@
 // Pure presentation logic (dialog rows, statuses, timeline order, history view decisions).
 // Kept framework-free so the rules can be unit tested.
 
-import type { Dialog, ForwardedFrom, Message, ReplyRef } from "../shared/types";
+import type { ChatKind, Dialog, ForwardedFrom, Message, Presence, ReplyRef, ServiceAction } from "../shared/types";
 import { previewText } from "../shared/text";
 import { activityDate, compareDialogs } from "../shared/dialogOrder";
+import { copy } from "./copy";
+
+/** Sentence for a system message; `actor` is the author's name (or "You"). */
+export function serviceText(s: ServiceAction, actor: string): string {
+  switch (s.type) {
+    case "groupCreated":
+      return copy.service.groupCreated(actor, s.title);
+    case "membersAdded":
+      return copy.service.membersAdded(actor, s.names);
+    case "memberRemoved":
+      return copy.service.memberRemoved(actor, s.name);
+    case "memberLeft":
+      return copy.service.memberLeft(actor);
+    case "groupRenamed":
+      return copy.service.groupRenamed(actor, s.title);
+    case "secretStarted":
+      return copy.service.secretStarted(actor);
+  }
+}
+
+/** One-line text of a confirmed message for previews (service messages become sentences). */
+export function messagePreview(m: Message): string {
+  if (m.service) return serviceText(m.service, m.out ? copy.you : (m.senderName ?? ""));
+  return previewText(m.text);
+}
 
 export type OutStatus = "failed" | "sending" | "sent" | "read";
 
@@ -84,8 +109,14 @@ export function badgeFor(d: { unreadCount: number; unreadMark: boolean; pinned: 
 
 export interface DialogRowModel {
   peerId: number;
+  kind: ChatKind;
   name: string;
-  subtitle: { kind: "draft"; text: string } | { kind: "message"; text: string; forwarded: boolean } | { kind: "empty" };
+  subtitle:
+    | { kind: "draft"; text: string }
+    | { kind: "message"; text: string; forwarded: boolean; sender?: string }
+    | { kind: "typing"; text: string }
+    | { kind: "empty" };
+  online: boolean;
   time: number | null;
   status: OutStatus | null;
   badge: Badge;
@@ -112,15 +143,19 @@ export function deriveRow(d: Dialog, latestPending: PendingMessage | null): Dial
     subtitle = { kind: "message", text: previewText(latestPending!.text), forwarded: !!latestPending!.forwardedFrom };
     status = pendingStatus(latestPending!);
   } else if (top) {
-    subtitle = { kind: "message", text: previewText(top.text), forwarded: !!top.forwardedFrom };
-    status = confirmedStatus(top, d.readOutboxMaxId);
+    // Groups show who wrote the last message.
+    const sender = d.kind === "group" && !top.service ? (top.out ? copy.you : top.senderName) : undefined;
+    subtitle = { kind: "message", text: messagePreview(top), forwarded: !!top.forwardedFrom, sender };
+    status = top.service ? null : confirmedStatus(top, d.readOutboxMaxId);
   } else {
     subtitle = { kind: "empty" };
   }
   return {
     peerId: d.peer.id,
+    kind: d.kind,
     name: d.peer.displayName,
     subtitle,
+    online: !!d.presence?.online,
     time: subtitle.kind === "empty" ? null : act || null,
     status,
     badge: badgeFor(d),
@@ -146,6 +181,19 @@ export function formatListTime(ts: number, now: number): string {
   const startToday = new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime();
   if (ts >= startToday - 6 * 86400_000) return d.toLocaleDateString(undefined, { weekday: "short" });
   return d.toLocaleDateString(undefined, { year: "2-digit", month: "short", day: "numeric" });
+}
+
+/** Header line for a person: "online", "last seen just now / at 14:05 / Mon, Oct 12". */
+export function presenceLabel(p: Presence | null, now: number): string {
+  if (!p) return "";
+  if (p.online) return copy.online;
+  if (p.lastSeen == null) return copy.lastSeenLongAgo;
+  if (now - p.lastSeen < 60_000) return copy.lastSeen("just now");
+  const d = new Date(p.lastSeen);
+  const n = new Date(now);
+  const sameDay = d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+  if (sameDay) return copy.lastSeen("at " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }));
+  return copy.lastSeen(d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }));
 }
 
 // ----------------------------------------------------------------- history view decisions

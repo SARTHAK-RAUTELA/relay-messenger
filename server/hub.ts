@@ -1,8 +1,9 @@
-// WebSocket push hub (spec 5.3).
+// WebSocket push hub (spec 5.3), plus the ephemeral presence and typing frames.
 import { WebSocketServer, type WebSocket } from "ws";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import type { Relay, PushedEvent } from "./relay";
+import type { ServerFrame } from "../src/shared/types";
 import { parseCookies, SESSION_COOKIE } from "./http";
 
 interface Client {
@@ -11,14 +12,20 @@ interface Client {
   sessionId: string;
 }
 
+/** Minimum gap between two typing notices from one user for one chat. */
+const TYPING_THROTTLE_MS = 1500;
+
 export class Hub {
-  /** The socket is push-only; clients only send tiny ping frames. */
+  /** The socket is push-only apart from tiny ping and typing frames. */
   static readonly MAX_PAYLOAD = 64 * 1024;
   private wss = new WebSocketServer({ noServer: true, maxPayload: Hub.MAX_PAYLOAD });
   private byUser = new Map<number, Set<Client>>();
+  private lastTyping = new Map<string, number>();
+  private closing = false;
 
   constructor(private relay: Relay) {
     relay.pusher = (events) => this.push(events);
+    relay.isOnline = (userId) => this.byUser.has(userId);
   }
 
   /**
@@ -53,36 +60,67 @@ export class Hub {
         return;
       }
       const client: Client = { ws, userId: user.id, sessionId };
+      const firstSocket = !this.byUser.has(user.id);
       const set = this.byUser.get(user.id) ?? new Set<Client>();
       set.add(client);
       this.byUser.set(user.id, set);
       ws.on("message", (raw) => {
-        let frame: { kind?: string } | null = null;
+        let frame: { kind?: string; peerId?: unknown } | null = null;
         try {
           frame = JSON.parse(String(raw));
         } catch {
           return;
         }
         if (frame?.kind === "ping") ws.send(JSON.stringify({ kind: "pong" }));
+        else if (frame?.kind === "typing") this.typing(user.id, frame.peerId);
       });
       ws.on("close", () => {
         set.delete(client);
-        if (set.size === 0) this.byUser.delete(user.id);
+        if (set.size === 0 && this.byUser.get(user.id) === set && !this.closing) {
+          this.byUser.delete(user.id);
+          this.relay.touchLastSeen(user.id);
+          this.broadcastPresence(user.id);
+        }
       });
       ws.on("error", () => {});
       ws.send(JSON.stringify({ kind: "hello", seq: this.relay.currentSeq(user.id), serverTime: this.relay.cfg.now() }));
+      if (firstSocket) {
+        this.relay.touchLastSeen(user.id);
+        this.broadcastPresence(user.id);
+      }
     });
+  }
+
+  private send(userId: number, frame: ServerFrame): void {
+    const set = this.byUser.get(userId);
+    if (!set) return;
+    const data = JSON.stringify(frame);
+    for (const c of set) if (c.ws.readyState === c.ws.OPEN) c.ws.send(data);
   }
 
   push(events: PushedEvent[]): void {
     for (const ev of events) {
-      const set = this.byUser.get(ev.userId);
-      if (!set) continue;
-      const frame = JSON.stringify({ kind: "event", seq: ev.seq, type: ev.type, data: ev.data });
-      for (const c of set) {
-        if (c.ws.readyState === c.ws.OPEN) c.ws.send(frame);
-      }
+      this.send(ev.userId, { kind: "event", seq: ev.seq, type: ev.type, data: ev.data } as ServerFrame);
     }
+  }
+
+  /** Tells `viewer` (or every watcher) what they may know about `userId`'s presence now. */
+  sendPresence(viewer: number, userId: number): void {
+    if (!this.byUser.has(viewer)) return;
+    this.send(viewer, { kind: "presence", userId, ...this.relay.presence(viewer, userId) });
+  }
+
+  broadcastPresence(userId: number): void {
+    for (const viewer of this.relay.presenceWatchers(userId)) this.sendPresence(viewer, userId);
+  }
+
+  private typing(userId: number, peerId: unknown): void {
+    const key = `${userId}:${String(peerId)}`;
+    const now = Date.now();
+    if (now - (this.lastTyping.get(key) ?? 0) < TYPING_THROTTLE_MS) return;
+    this.lastTyping.set(key, now);
+    if (this.lastTyping.size > 10_000) this.lastTyping.clear();
+    for (const t of this.relay.typingTargets(userId, peerId)) this.send(t.userId, { kind: "typing", peerId: t.peerId, userId });
   }
 
   /** BR-AUTH-2: logging out closes that browser session's sockets. */
@@ -98,6 +136,7 @@ export class Hub {
   }
 
   close(): void {
+    this.closing = true; // the database closes right after; skip last-seen writes
     for (const set of this.byUser.values()) for (const c of set) c.ws.terminate();
     this.wss.close();
   }

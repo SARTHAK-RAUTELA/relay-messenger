@@ -67,7 +67,7 @@ export class TestUser {
   }
 
   async register(username: string, displayName = username, password = "secret123") {
-    const r = await this.call("POST", "/api/auth/register", { username, displayName, password });
+    const r = await this.call("POST", "/api/auth/register", { username, email: `${username}@example.test`, displayName, password });
     if (r.status !== 201) throw new Error("register failed " + JSON.stringify(r.body));
     this.user = r.body.user;
     return this;

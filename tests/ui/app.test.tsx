@@ -1,11 +1,15 @@
 // @vitest-environment jsdom
 // Full UI (Shell) rendered in jsdom against the real in-process server.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MessengerContext } from "../../src/components/context";
 import { Shell } from "../../src/components/RelayApp";
 import { TestUser, startServer, twoUsers, type TestServer } from "../helpers/server";
 import { TestClient, deferred } from "../helpers/client";
+
+// These tests talk to a real server; under a full parallel run a forward to two chats can take
+// longer than testing-library's 1 s default wait (that made AC-66 flaky).
+configure({ asyncUtilTimeout: 5000 });
 
 let srv: TestServer;
 let a: TestUser;

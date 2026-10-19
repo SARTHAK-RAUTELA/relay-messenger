@@ -6,6 +6,8 @@ import { copy } from "@/client/copy";
 import { useMessenger } from "./context";
 import { DialogRow } from "./DialogRow";
 import { Logo } from "./Logo";
+import { NewGroupDialog } from "./GroupDialogs";
+import { SettingsDialog } from "./SettingsDialog";
 
 export function Sidebar() {
   const m = useMessenger();
@@ -14,6 +16,7 @@ export function Sidebar() {
   const [found, setFound] = useState<UserSummary[]>([]);
   const [now, setNow] = useState(() => Date.now());
   const dragging = useRef<number | null>(null);
+  const [dialog, setDialog] = useState<"settings" | "group" | null>(null);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 60_000);
@@ -47,12 +50,16 @@ export function Sidebar() {
           <Logo size={24} /> {copy.product}
         </span>
         <span style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
-          {m.me?.displayName}
+          <button className="me" onClick={() => setDialog("settings")} title={copy.settings}>
+            {m.me?.displayName}
+          </button>
           <button className="ghost" onClick={() => void m.logout()}>
             {copy.signOut}
           </button>
         </span>
       </div>
+      {dialog === "settings" && <SettingsDialog onClose={() => setDialog(null)} />}
+      {dialog === "group" && <NewGroupDialog onClose={() => setDialog(null)} />}
       <div className="search">
         <input type="search" placeholder={copy.searchPlaceholder} value={q} onChange={(e) => setQ(e.target.value)} aria-label={copy.searchPlaceholder} />
         {found.length > 0 && (
@@ -72,6 +79,11 @@ export function Sidebar() {
             ))}
           </ul>
         )}
+      </div>
+      <div className="sidebar-tools">
+        <button className="ghost" onClick={() => setDialog("group")}>
+          + {copy.newGroup}
+        </button>
       </div>
       <ul className="dialog-list" aria-label="Conversations">
         {m.phase === "loading" && <li className="skeleton" style={{ margin: 12 }} />}

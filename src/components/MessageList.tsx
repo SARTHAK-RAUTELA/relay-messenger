@@ -191,6 +191,13 @@ export function MessageList(props: {
             )}
             <MessageBubble
               item={item}
+              senderName={
+                dialog?.kind === "group" && item.kind === "message" && !item.message.out
+                  ? m.senderNameFor(peerId, item.message.senderId, item.message)
+                  : null
+              }
+              canForward={dialog?.kind !== "secret"}
+              onReact={(emoji) => id != null && void m.react(peerId, id, emoji)}
               canEdit={item.kind === "message" && m.canEdit(item.message)}
               highlighted={id != null && conv.highlightId === id}
               selectionMode={!!selection}

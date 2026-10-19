@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Messenger } from "@/client/messenger";
 import { copy } from "@/client/copy";
+import { IndexedDbKeyStore } from "@/client/secret";
 import { MessengerContext, useMessenger } from "./context";
 import { Sidebar } from "./Sidebar";
 import { Conversation } from "./Conversation";
@@ -16,6 +17,7 @@ function createBrowserMessenger(): Messenger {
     fetch: (input, init) => window.fetch(input, init),
     openSocket: (url) => new WebSocket(url) as never,
     storage: window.localStorage,
+    secretKeys: typeof indexedDB !== "undefined" ? new IndexedDbKeyStore() : null,
   });
 }
 
@@ -103,6 +105,7 @@ export function AuthScreen() {
   const m = useMessenger();
   const [mode, setMode] = useState<"in" | "up">("in");
   const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -113,7 +116,7 @@ export function AuthScreen() {
     setError(null);
     try {
       if (mode === "in") await m.login(username, password);
-      else await m.register(username, displayName, password);
+      else await m.register(username, email, displayName, password);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
@@ -128,9 +131,15 @@ export function AuthScreen() {
         </h1>
         <p style={{ margin: 0, color: "var(--ink-soft)" }}>{copy.tagline}</p>
         <label>
-          {copy.username}
+          {mode === "in" ? copy.usernameOrEmail : copy.username}
           <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" required />
         </label>
+        {mode === "up" && (
+          <label>
+            {copy.email}
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
+          </label>
+        )}
         {mode === "up" && (
           <label>
             {copy.displayName}
