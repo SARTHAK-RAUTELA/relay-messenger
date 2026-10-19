@@ -36,7 +36,7 @@ The long-term goal is a real-time messenger with private chats, groups and end-t
 
 **Quality**
 - Strict TypeScript (`npm run typecheck` is clean).
-- Vitest suites: server integration, client-core integration, unit, and jsdom UI tests.
+- Vitest suites: server integration, client-core integration, unit, and jsdom UI tests (172 tests; see the known flaky test below).
 - Playwright end-to-end tests for read receipts, pin reordering, history paging, unread divider and reply jumps (last run: passing).
 - `start-relay.bat`: one-click Windows launcher that starts the server and an ngrok tunnel so other devices can join (it contains machine-specific paths and an ngrok domain; edit them before using it).
 
